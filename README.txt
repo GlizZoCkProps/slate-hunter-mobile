@@ -1,33 +1,36 @@
-SLATE HUNTER v3 — DEPLOYABLE STARTER
+SLATE HUNTER v4 — CONSOLIDATED FREE-FIRST RELEASE
 
-WHAT WORKS
-- Mobile-first web app.
-- One-tap scan request to backend.
-- Fetches upcoming NFL, NBA, and college football schedules from ESPN's public scoreboard endpoints for today, 3 days, or 7 days.
-- Builds a grounded research brief using the returned slate.
-- No tracker/database.
+WHAT THIS BUILD DOES
+- Scans NFL, NBA and college football schedules from ESPN's public scoreboard endpoints.
+- Separates upcoming games, games in progress, and completed games.
+- Displays game start times in the phone/browser's local timezone.
+- Includes player search using ESPN's public search endpoint.
+- Attempts to retrieve player game logs and calculates a simple recent/season weighted baseline for selected markets.
+- Lets you enter a posted line manually and compares it to that simple baseline.
+- Generates a research brief with rules against inventing lines or data.
+- Does not require a database or paid API key.
 
-IMPORTANT LIMITATION
-This is the first deployable backend step, not yet a fully autonomous player-prop projection engine. ESPN schedule endpoints do not provide player props. Free odds API tiers commonly exclude player props; The Odds API documentation currently says its free tier is limited to NFL/NBA/MLB moneyline (h2h) odds, while player-prop edge data is a paid Business feature. Do not describe this starter as already finding verified player props or projections.
+IMPORTANT LIMITATIONS
+- This is a research assistant, not a betting guarantee.
+- ESPN's public endpoints are unofficial and can change shape or rate-limit requests.
+- Player search and log parsing are best-effort; inspect the displayed sample, metric label and source before trusting any result.
+- Player prop lines are NOT fetched automatically. Enter the line from the platform/book you are looking at. The free tier of many odds APIs does not include player props. A truly automated cross-book prop-line feed may require a paid provider or a separately configured data source.
+- The projection is a simple heuristic (65% recent 5-game mean + 35% available sample mean), not a calibrated statistical model. It does not fully adjust for minutes, injuries, role, pace, matchup, weather, or lineup changes.
+- No picks are guaranteed. Verify active status and current lines before making decisions.
 
-DEPLOY FOR FREE WITH RENDER
-1. Create/sign into GitHub and create a new repository named slate-hunter-mobile.
-2. Upload the files in this folder to the repository root, keeping templates/index.html in the templates folder.
-3. Create/sign into Render.
-4. Choose New > Web Service and connect the repository.
-5. Settings:
-   - Runtime: Python
-   - Build command: pip install -r requirements.txt
-   - Start command: gunicorn app:app
-   - Instance type: Free
-6. Deploy. Render gives you an HTTPS URL; open it on your Galaxy S26 and add it to your home screen from Chrome's menu.
+DEPLOYMENT ON RENDER
+1. Download and extract the ZIP on a computer.
+2. Open your existing GitHub repository: GlizZoCkProps/slate-hunter-mobile.
+3. Replace the repository files with the files from this ZIP, preserving templates/index.html inside the templates folder.
+4. Commit changes to the main branch.
+5. Render should redeploy the existing service automatically. Keep the Free plan; do not upgrade unless you choose to.
+6. Test /api/health, then open the app and press HUNT PROPS.
 
-Render free services sleep after 15 minutes idle and can take about a minute to wake up. Free host storage is ephemeral, but this app does not rely on local persistent storage.
+REPOSITORY LAYOUT
+app.py
+requirements.txt
+render.yaml
+README.txt
+templates/index.html
 
-NEXT ENGINE MILESTONES
-1. Add a permitted player-stat source for season/recent logs and usage.
-2. Add a reliable player-prop line source covering relevant sports/books.
-3. Add projection methodology, probability calibration, and cross-book line comparison.
-4. Only call a prop a value edge when a current line and evidence-backed projection both exist.
-
-Do not paste API keys into frontend HTML or commit them to GitHub. If/when a provider key is needed, add it as a Render environment variable.
+NO API KEYS REQUIRED.
