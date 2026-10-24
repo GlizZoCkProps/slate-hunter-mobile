@@ -57,10 +57,10 @@ def event_status(event):
     return state, completed, detail
 
 
-def parse_games(sport, days):
+def parse_games(sport, days, local_today=None):
     spec = SPORTS[sport]
     out, errors = [], []
-    local_today = datetime.now().astimezone().date()
+    local_today = local_today or datetime.now().astimezone().date()
     for offset in range(days):
         day = local_today + timedelta(days=offset)
         try:
@@ -288,22 +288,27 @@ def hunt():
     body = request.get_json(silent=True) or {}
     sports = [s for s in body.get("sports", ["NFL", "NBA", "CFB"]) if s in SPORTS]
     days = max(1, min(int(body.get("days", 7)), 7))
+    requested_start = str(body.get("startDate", "")).strip()
+    try:
+        local_start = datetime.strptime(requested_start, "%Y-%m-%d").date() if requested_start else datetime.now().astimezone().date()
+    except ValueError:
+        local_start = datetime.now().astimezone().date()
     games, errors = [], []
     for sport in sports:
-        found, errs = parse_games(sport, days)
+        found, errs = parse_games(sport, days, local_start)
         games.extend(found); errors.extend(errs)
     games.sort(key=lambda g: g.get("date") or "")
     upcoming = [g for g in games if g["bucket"] == "upcoming"]
     live = [g for g in games if g["bucket"] == "live"]
     final = [g for g in games if g["bucket"] == "final"]
-    brief = build_research_brief(sports, days, upcoming, live)
-    return jsonify({"generatedAt": datetime.now(timezone.utc).isoformat(), "days": days, "sports": sports,
+    brief = build_research_brief(sports, days, upcoming, live, local_start)
+    return jsonify({"generatedAt": datetime.now(timezone.utc).isoformat(), "days": days, "startDate": local_start.isoformat(), "sports": sports,
                     "gameCount": len(games), "upcomingCount": len(upcoming), "liveCount": len(live), "finalCount": len(final),
                     "upcoming": upcoming, "live": live, "final": final, "errors": errors, "nextResearchBrief": brief})
 
 
-def build_research_brief(sports, days, upcoming, live):
-    today = datetime.now().astimezone().date().isoformat()
+def build_research_brief(sports, days, upcoming, live, local_today=None):
+    today = (local_today or datetime.now().astimezone().date()).isoformat()
     def lines_for(games):
         out = []
         for g in games[:100]:
