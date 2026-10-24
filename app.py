@@ -516,23 +516,33 @@ def live_game():
                 try:
                     roster = fetch_json(f"{ESPN_SITE}/{spec['path']}/teams/{team['id']}/roster", cache_seconds=60)
                     roster_players = []
-                    for athlete in roster.get("athletes") or []:
-                        if not athlete.get("id"):
+                    for roster_group in roster.get("athletes") or []:
+                        if not isinstance(roster_group, dict):
                             continue
-                        position = athlete.get("position") or {}
-                        athlete_status = athlete.get("status") or {}
-                        roster_players.append({"id": str(athlete["id"]), "name": athlete.get("displayName") or athlete.get("fullName") or "Player",
-                                               "position": position.get("abbreviation", "") if isinstance(position, dict) else "",
-                                               "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
-                                               "starter": False, "didNotPlay": False,
-                                               "availability": athlete_status.get("abbreviation") or athlete_status.get("name") or "",
-                                               "injuries": athlete.get("injuries") or [], "stats": []})
+                        # ESPN groups many team rosters by position and nests the
+                        # actual athletes under each group's `items` array.
+                        entries = roster_group.get("items")
+                        if not isinstance(entries, list):
+                            entries = [roster_group]
+                        for athlete in entries:
+                            if not isinstance(athlete, dict) or not athlete.get("id"):
+                                continue
+                            position = athlete.get("position") or roster_group.get("position") or {}
+                            athlete_status = athlete.get("status") or {}
+                            roster_players.append({"id": str(athlete["id"]), "name": athlete.get("displayName") or athlete.get("fullName") or "Player",
+                                                   "position": position.get("abbreviation") or position.get("displayName", "") if isinstance(position, dict) else str(position),
+                                                   "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
+                                                   "starter": False, "didNotPlay": False,
+                                                   "availability": athlete_status.get("abbreviation") or athlete_status.get("displayName") or athlete_status.get("name") or "",
+                                                   "injuries": athlete.get("injuries") or [], "stats": []})
                     players_by_team.append({"teamId": team["id"], "players": roster_players})
                 except Exception as roster_exc:
                     roster_errors.append(f"{team['name']}: {type(roster_exc).__name__}")
                     players_by_team.append({"teamId": team["id"], "players": []})
+        game_state, completed, _ = event_status({"status": status_obj})
         return jsonify({"sport": sport, "eventId": event_id, "status": status, "teams": teams, "playersByTeam": players_by_team,
                         "rosterOnly": not has_game_players, "lineupConfirmed": has_game_players,
+                        "gameState": game_state, "completed": completed, "isLive": game_state == "in",
                         "rosterMessage": "Current team rosters shown; ESPN has not posted the confirmed game lineup yet." if not has_game_players else "Players listed from this game's box score.",
                         "rosterErrors": roster_errors, "generatedAt": datetime.now(timezone.utc).isoformat(),
                         "source": "ESPN public box score and team roster" if not has_game_players else "ESPN public box score"})
