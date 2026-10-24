@@ -497,7 +497,7 @@ def prop_line():
    candidates=[e for e in events if any(t in norm(e.get("home_team")) or t in norm(e.get("away_team")) for t in tokens)]
   for event in candidates[:2]:
    odds=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event['id']}/odds",
-    {"apiKey":api_key,"regions":"us","markets":market_key,"bookmakers":book,"oddsFormat":"american"},cache_seconds=45)
+    {"apiKey":api_key,"regions":"us_dfs" if book=="prizepicks" else "us","markets":market_key,"bookmakers":book,"oddsFormat":"american"},cache_seconds=45)
    for bm in odds.get("bookmakers",[]):
     if bm.get("key")!=book: continue
     for market in bm.get("markets",[]):
