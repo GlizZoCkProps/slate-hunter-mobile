@@ -374,7 +374,7 @@ def player_research():
                     "sourceLink": f"https://www.espn.com/{'nba' if sport == 'NBA' else 'nfl' if sport == 'NFL' else 'college-football'}/player/_/id/{athlete_id}",
                     "warnings": ["ESPN's public gamelog structure can change; check the sample and labels before relying on it.",
                                  "Projection is a simple recent/season blend, not a calibrated model or betting probability.",
-                                 "The line is entered by you; this tool does not claim to fetch live player-prop odds."] + (["No usable numeric game-log values were parsed for this metric."] if not values else [])})
+                                 "Verify the selected or manually entered line against the sportsbook before using results."] + (["No usable numeric game-log values were parsed for this metric."] if not values else [])})
 
 
 @app.post("/api/live-game")
@@ -466,6 +466,52 @@ def live_game():
     except Exception as exc:
         return jsonify({"error": f"Game players unavailable ({type(exc).__name__}). Try refreshing shortly."}), 502
 
+
+
+
+ODDS_SPORTS = {"NBA": "basketball_nba", "NFL": "americanfootball_nfl", "CFB": "americanfootball_ncaaf"}
+ODDS_MARKETS = {
+ "NBA":{"points":"player_points","rebounds":"player_rebounds","assists":"player_assists","three_pointers":"player_threes","steals":"player_steals","blocks":"player_blocks","turnovers":"player_turnovers"},
+ "NFL":{"passing_yards":"player_pass_yds","rushing_yards":"player_rush_yds","receiving_yards":"player_reception_yds","receptions":"player_receptions","touchdowns":"player_pass_tds"},
+ "CFB":{"passing_yards":"player_pass_yds","rushing_yards":"player_rush_yds","receiving_yards":"player_reception_yds","receptions":"player_receptions","touchdowns":"player_pass_tds"},
+}
+@app.post("/api/prop-line")
+def prop_line():
+ body=request.get_json(silent=True) or {}
+ sport=str(body.get("sport","")).upper(); metric=str(body.get("metric","")).lower()
+ athlete=re.sub(r"\s+"," ",str(body.get("player","")).strip()).lower()
+ team=re.sub(r"\s+"," ",str(body.get("team","")).strip()).lower()
+ book=re.sub(r"[^a-z0-9_]","",str(body.get("book","")).lower())
+ api_key=os.environ.get("ODDS_API_KEY","").strip()
+ if not api_key: return jsonify({"error":"Automatic lines are not connected yet. Add ODDS_API_KEY to Render, then redeploy."}),503
+ sport_key=ODDS_SPORTS.get(sport); market_key=ODDS_MARKETS.get(sport,{}).get(metric)
+ if not all((sport_key,market_key,athlete,book,team)):
+  return jsonify({"error":"This sport, market, player, team, or sportsbook is not supported for automatic lines."}),400
+ def norm(value): return re.sub(r"[^a-z0-9]","",str(value or "").lower())
+ try:
+  events=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events",{"apiKey":api_key},cache_seconds=60)
+  team_key=norm(team)
+  candidates=[e for e in events if team_key and (team_key in norm(e.get("home_team")) or team_key in norm(e.get("away_team")))]
+  if not candidates:
+   tokens=[norm(x) for x in re.split(r"\s+,team) if len(norm(x))>=4]
+   candidates=[e for e in events if any(t in norm(e.get("home_team")) or t in norm(e.get("away_team")) for t in tokens)]
+  for event in candidates[:2]:
+   odds=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event['id']}/odds",
+    {"apiKey":api_key,"regions":"us","markets":market_key,"bookmakers":book,"oddsFormat":"american"},cache_seconds=45)
+   for bm in odds.get("bookmakers",[]):
+    if bm.get("key")!=book: continue
+    for market in bm.get("markets",[]):
+     if market.get("key")!=market_key: continue
+     for outcome in market.get("outcomes",[]):
+      if norm(outcome.get("description") or outcome.get("name"))==norm(athlete) and outcome.get("point") is not None:
+       return jsonify({"line":outcome["point"],"book":bm.get("title") or book,"market":market.get("title") or market_key,
+        "event":event.get("away_team","")+" at "+event.get("home_team",""),"updatedAt":odds.get("last_update"),"source":"The Odds API"})
+  return jsonify({"error":"No current line was found for this player at that book. The game, market, or player prop may not be posted yet."}),404
+ except requests.HTTPError as exc:
+  status=getattr(getattr(exc,"response",None),"status_code",502)
+  return jsonify({"error":f"Odds provider request failed (HTTP {status}). Check the Render key and provider access."}),502
+ except Exception as exc:
+  return jsonify({"error":f"Could not retrieve the current line ({type(exc).__name__})."}),502
 
 @app.get("/robots.txt")
 def robots():
