@@ -9,3 +9,13 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
+      # Render free disks are wiped on restart, so the dashboard reads the
+      # collector's database from the GitHub `data` branch (read-only copy).
+      - key: SLATE_DB_URL
+        value: https://raw.githubusercontent.com/GlizZoCkProps/slate-hunter-mobile/data/slate_hunter.db
+      - key: SLATE_DB_REFRESH_SEC
+        value: "600"
+      # ODDS_API_KEY is optional for the interactive lookup; set it in the
+      # Render dashboard (never commit it).
+      - key: ODDS_API_KEY
+        sync: false

@@ -1,0 +1,18 @@
+# Optional: always-on collector on a Linux VPS / home server instead of GitHub Actions.
+# Install: copy to /etc/systemd/system/, edit paths/user, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now slate-hunter-collector
+[Unit]
+Description=Slate Hunter collector loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=slatehunter
+WorkingDirectory=/opt/slate-hunter-mobile
+EnvironmentFile=/opt/slate-hunter-mobile/.env
+ExecStart=/usr/bin/python3 -m slatehunter loop --tick 120
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

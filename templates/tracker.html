@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#070b14"><title>Slate Hunter Tracker</title>
+<style>
+:root{color-scheme:dark;--panel:#151d30;--text:#f3f6fc;--muted:#a8b4ca;--accent:#42d9ff;--violet:#a78bfa;--line:#2b3852;--good:#4ade80;--bad:#f87171;--warn:#fbbf24}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(160deg,#111a2d,#080c16 65%);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;min-height:100vh}
+main{max-width:980px;margin:auto;padding:16px 14px 44px}a{color:var(--accent)}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:6px 0 14px}.title{font-size:22px;font-weight:900}.sub{color:var(--muted);font-size:12px}
+.tabs{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px}.tab{flex:0 0 auto;background:#10182a;border:1px solid var(--line);border-radius:11px;color:var(--muted);padding:9px 13px;font-weight:800;cursor:pointer;font:inherit}
+.tab.active{background:var(--accent);border-color:var(--accent);color:#07101b}
+.panel{background:rgba(21,29,48,.97);border:1px solid var(--line);border-radius:16px;padding:14px;margin:12px 0}
+h2{font-size:16px;margin:0 0 10px}.note{color:var(--muted);font-size:12px;margin:0 0 10px}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{color:var(--muted);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+td.num{text-align:right;font-variant-numeric:tabular-nums}.ok{color:var(--good)}.failed{color:var(--bad)}.partial,.skipped{color:var(--warn)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.stat{background:#10182a;border:1px solid var(--line);border-radius:12px;padding:10px}.stat b{display:block;font-size:20px}.stat span{color:var(--muted);font-size:11px}
+.btns{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.btns a{display:block;text-align:center;background:#1d2940;border:1px solid var(--line);border-radius:11px;padding:11px;text-decoration:none;color:var(--text);font-weight:700}
+pre{white-space:pre-wrap;font-size:12px;color:var(--muted)}
+</style></head>
+<body><main>
+<div class="top"><div><div class="title">Tracker</div><div class="sub" id="src">Loading…</div></div><a href="/">← Research</a></div>
+<div class="tabs" role="tablist">
+  <button class="tab active" data-v="status">Collector</button><button class="tab" data-v="candidates">Candidates</button>
+  <button class="tab" data-v="performance">Performance</button><button class="tab" data-v="moves">Line moves</button><button class="tab" data-v="export">Export</button>
+</div>
+<div id="view"></div>
+<p class="note">Verified data comes from ESPN and The Odds API as collected. Projections are a simple baseline (baseline_v1), not calibrated probabilities. Nothing here is a guarantee.</p>
+</main>
+<script>
+const esc=v=>v===null||v===undefined?'—':String(v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const table=(rows,cols)=>{if(!rows||!rows.length)return '<p class="note">No rows yet.</p>';
+  return '<div class="scroll"><table><thead><tr>'+cols.map(c=>'<th>'+esc(c[1])+'</th>').join('')+'</tr></thead><tbody>'+
+  rows.map(r=>'<tr>'+cols.map(c=>{const v=r[c[0]];const n=typeof v==='number';const cls=(c[0]==='status'?esc(v):'')+(n?' num':'');return '<td class="'+cls+'">'+esc(v)+'</td>'}).join('')+'</tr>').join('')+'</tbody></table></div>'};
+async function get(u){const r=await fetch(u);const j=await r.json();document.getElementById('src').textContent='Database: '+(j.dbSource||'unknown');if(!j.available)throw new Error(j.reason||'Unavailable');return j}
+const views={
+ async status(){const j=await get('/api/tracker/status');const q=j.odds_api_quota;
+  return '<div class="panel"><h2>Overview</h2><div class="grid">'+Object.entries(j.table_counts).map(([k,v])=>'<div class="stat"><b>'+v+'</b><span>'+esc(k)+'</span></div>').join('')+
+  '<div class="stat"><b>'+(q?q.quota_remaining:'—')+'</b><span>Odds API credits left</span></div></div></div>'+
+  '<div class="panel"><h2>Last run per job</h2>'+table(j.last_runs,[['job','Job'],['started_at_utc','Started (UTC)'],['status','Status'],['items_written','Items'],['error_count','Errors'],['message','Message']])+'</div>'+
+  '<div class="panel"><h2>Errors & missing data, last 24h</h2>'+table(j.errors_last_24h,[['kind','Kind'],['source','Source'],['error_type','Type'],['n','Count']])+'</div>'},
+ async candidates(){const j=await get('/api/tracker/candidates');
+  return '<div class="panel"><h2>Upcoming lines vs. projection</h2><p class="note">'+esc(j.note)+'</p>'+
+  table(j.candidates,[['start_time_ct','Start (CT)'],['game','Game'],['book_key','Book'],['player_name','Player'],['market','Market'],['line','Line'],['over_price','Over'],['under_price','Under'],['projection','Proj'],['gap','Gap'],['sample_size','N'],['injury_status','Injury'],['collected_at_ct','Seen (CT)'],['snapshot_id','Snap']])+'</div>'},
+ async performance(){const j=await get('/api/tracker/performance');
+  return '<div class="panel"><h2>Every tracked prop, graded at closing line</h2>'+table(j.grades,[['sport','Sport'],['market','Market'],['side','Side'],['tracked','Tracked'],['wins','W'],['losses','L'],['pushes','P'],['voids','Void'],['ungraded','Ungraded'],['hit_rate','Hit rate']])+'</div>'+
+  '<div class="panel"><h2>Projection error</h2>'+table(j.projectionError,[['model_version','Model'],['sport','Sport'],['market','Market'],['n','N'],['mae','MAE'],['bias_actual_minus_proj','Bias']])+'</div>'+
+  '<div class="panel"><h2>Paper picks (simulated)</h2>'+table(j.paper,[['model_version','Model'],['picks','Picks'],['open','Open'],['wins','W'],['losses','L'],['pushes','P'],['profit_units','Units'],['roi','ROI'],['avg_clv_line','CLV line'],['avg_clv_prob','CLV prob']])+'</div>'},
+ async moves(){const j=await get('/api/tracker/moves');
+  return '<div class="panel"><h2>Observed line & price moves</h2><p class="note">'+esc(j.note)+'</p>'+table(j.moves,[['observed_at_utc','Seen (UTC)'],['player_name','Player'],['market','Market'],['book_key','Book'],['side','Side'],['signal_type','Type'],['value_before','Before'],['value_after','After'],['evidence_level','Evidence'],['source_url','Source']])+'</div>'},
+ async export(){await get('/api/tracker/status');const t=['prop_snapshots','games','projections','prop_grades','results','paper_picks','market_signals','injury_reports','collection_runs','collection_errors'];
+  return '<div class="panel"><h2>CSV exports</h2><div class="btns">'+t.map(x=>'<a href="/api/export/'+x+'.csv">'+x+'</a>').join('')+'</div></div><div class="panel"><h2>Daily report</h2><div class="btns"><a href="/api/tracker/report">Open markdown report</a></div></div>'}
+};
+async function show(v){document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.v===v));const el=document.getElementById('view');el.innerHTML='<div class="panel note">Loading…</div>';
+ try{el.innerHTML=await views[v]()}catch(e){el.innerHTML='<div class="panel"><h2>Unavailable</h2><p class="note">'+esc(e.message)+'</p></div>'}}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>show(b.dataset.v));show('status');
+</script></body></html>

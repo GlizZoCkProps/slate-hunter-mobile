@@ -1,5 +1,15 @@
 SLATE HUNTER v4 — CONSOLIDATED FREE-FIRST RELEASE
 
+NEW IN 0.5 (feature/persistent-collector): persistent SQLite tracking.
+- `python -m slatehunter ...` collector: games, prop snapshots (DraftKings,
+  FanDuel, PrizePicks via The Odds API), injuries, baseline projections,
+  post-game grading of every tracked prop, paper picks with CLV, daily reports,
+  and CSV exports. Every run and every failure is logged in the database.
+- Free always-on host: .github/workflows/collector.yml (database kept on the
+  `data` branch). Dashboard: /tracker.
+- Full architecture, setup, data-source limits and verification status:
+  see PROJECT_HANDOFF.md. Tests: python -m unittest discover -s tests -v
+
 WHAT THIS BUILD DOES
 - Scans NFL, NBA and college football schedules from ESPN's public scoreboard endpoints.
 - Separates upcoming games, games in progress, and completed games.
@@ -8,7 +18,7 @@ WHAT THIS BUILD DOES
 - Attempts to retrieve player game logs and calculates a simple recent/season weighted baseline for selected markets.
 - Lets you enter a posted line manually and compares it to that simple baseline.
 - Generates a research brief with rules against inventing lines or data.
-- Does not require a database or paid API key.
+- The interactive research page does not require a database or paid API key.
 
 IMPORTANT LIMITATIONS
 - This is a research assistant, not a betting guarantee.
@@ -27,10 +37,13 @@ DEPLOYMENT ON RENDER
 6. Test /api/health, then open the app and press HUNT PROPS.
 
 REPOSITORY LAYOUT
-app.py
-requirements.txt
-render.yaml
-README.txt
-templates/index.html
+app.py                      web app (research UI + read-only tracker)
+slatehunter/                collector, database, grading, reports
+templates/index.html        research UI
+templates/tracker.html      tracker dashboard
+tests/                      offline tests
+.github/workflows/          scheduled collector
+deploy/                     optional systemd unit
+PROJECT_HANDOFF.md          start here
 
-NO API KEYS REQUIRED.
+The research UI needs no API key. Automatic prop lines need ODDS_API_KEY.
