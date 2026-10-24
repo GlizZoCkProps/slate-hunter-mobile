@@ -259,20 +259,30 @@ def choose_metric(sport, metric, labels, rows):
         low = label.lower()
         if any(a == low or a in low for a in names):
             idx = i; break
-    values = []
+    values = []; game_rows = []
     for row in rows:
         vals = row.get("values", [])
         if idx is not None and idx < len(vals):
             val = parse_numeric(vals[idx])
-            if val is not None: values.append(val)
+            if val is not None:
+                values.append(val)
+                raw=row.get("raw", {})
+                opponent=raw.get("opponent") or raw.get("opponentTeam") or raw.get("opponentDisplayName") or ""
+                if isinstance(opponent,dict): opponent=opponent.get("displayName") or opponent.get("name") or ""
+                game_rows.append({"value":val,"label":row.get("label") or raw.get("date") or "Game","opponent":str(opponent)})
         else:
             raw = row.get("raw", {})
             # Try keyed stats objects as a fallback.
             for key, val in raw.items():
                 if any(a.replace(" ", "") in str(key).lower().replace(" ", "") for a in names):
                     num = parse_numeric(val)
-                    if num is not None: values.append(num); break
-    return values, (labels[idx] if idx is not None else None)
+                    if num is not None:
+                        values.append(num)
+                        opponent=raw.get("opponent") or raw.get("opponentTeam") or raw.get("opponentDisplayName") or ""
+                        if isinstance(opponent,dict): opponent=opponent.get("displayName") or opponent.get("name") or ""
+                        game_rows.append({"value":num,"label":row.get("label") or raw.get("date") or "Game","opponent":str(opponent)})
+                        break
+    return values, (labels[idx] if idx is not None else None), game_rows
 
 
 @app.get("/")
@@ -348,16 +358,44 @@ def player_research():
     allowed = {"points", "rebounds", "assists", "minutes", "passing_yards", "rushing_yards", "receiving_yards", "receptions", "touchdowns", "three_pointers", "steals", "blocks", "turnovers"}
     if metric not in allowed: metric = "points"
     line = parse_numeric(body.get("line"))
+    team = str(body.get("team", "")).strip()
+    opponent = str(body.get("opponent", "")).strip()
+    book = re.sub(r"[^a-z0-9_]", "", str(body.get("book", "")).lower())
+    event_id = re.sub(r"[^0-9]", "", str(body.get("eventId", "")))
     data, source_url, errors = athlete_profile(sport, athlete_id)
     labels, rows = flatten_stat_labels(data)
-    values, label = choose_metric(sport, metric, labels, rows)
+    values, label, game_rows = choose_metric(sport, metric, labels, rows)
     recent = values[:5]
+    last10 = values[:10]
     season = values
     avg5 = round(statistics.mean(recent), 2) if recent else None
+    avg10 = round(statistics.mean(last10), 2) if last10 else None
     avg_all = round(statistics.mean(season), 2) if season else None
     median5 = round(statistics.median(recent), 2) if recent else None
+    median10 = round(statistics.median(last10), 2) if last10 else None
     weighted = round((statistics.mean(recent) * .65 + statistics.mean(season) * .35), 2) if recent and season else (avg5 if avg5 is not None else avg_all)
-    hit_rate = round(sum(1 for v in recent if line is not None and v > line) / len(recent) * 100) if recent and line is not None else None
+    odds_context = get_prop_market_context(sport, metric, str(body.get("player", "")), team, opponent, book) if book else {"available": False, "reason": "Choose a sportsbook to compare current lines."}
+    selected_market_line = odds_context.get("selectedBookLine", {}).get("line") if odds_context.get("selectedBookLine") else None
+    line_source = "User-entered line" if line is not None else ""
+    if line is None and selected_market_line is not None:
+        line = selected_market_line
+        line_source = odds_context.get("selectedBookLine", {}).get("book") or "The Odds API"
+    elif line is not None and selected_market_line is not None and abs(float(line) - float(selected_market_line)) < 0.01:
+        line_source = odds_context.get("selectedBookLine", {}).get("book") or "The Odds API"
+    def hit_summary(sample):
+        if line is None or not sample:
+            return {"sampleSize": len(sample), "over": None, "under": None, "push": None, "overRate": None, "underRate": None}
+        over = sum(1 for value in sample if value > line)
+        under = sum(1 for value in sample if value < line)
+        push = len(sample) - over - under
+        return {"sampleSize": len(sample), "over": over, "under": under, "push": push,
+                "overRate": round(over / len(sample) * 100),
+                "underRate": round(under / len(sample) * 100),
+                "pushRate": round(push / len(sample) * 100)}
+    recent5_hits = hit_summary(recent)
+    recent10_hits = hit_summary(last10)
+    season_hits = hit_summary(season)
+    hit_rate = recent5_hits["overRate"]
     if line is None or weighted is None:
         lean = "INSUFFICIENT DATA"
         gap = None
@@ -367,14 +405,49 @@ def player_research():
         if abs(gap) < max(1.0, abs(line) * .07): lean = "NO CLEAR EDGE"
         elif gap > 0: lean = "OVER LEAN"
         else: lean = "UNDER LEAN"
+    evidence_signals=[]
+    def add_rate_signal(source, value):
+        if value is None: return
+        side="OVER" if value > 50 else "UNDER" if value < 50 else "NEUTRAL"
+        evidence_signals.append({"source":source,"side":side,"value":value})
+    def add_direction_signal(source, value, threshold):
+        if value is None or threshold is None: return
+        side="OVER" if value > threshold else "UNDER" if value < threshold else "NEUTRAL"
+        evidence_signals.append({"source":source,"side":side,"value":value,"threshold":threshold})
+    add_rate_signal("Last 5 hit rate", recent5_hits["overRate"])
+    add_rate_signal("Last 10 hit rate", recent10_hits["overRate"])
+    add_rate_signal("Season hit rate", season_hits["overRate"])
+    add_direction_signal("Weighted historical baseline", weighted, line)
+    if odds_context.get("consensusLine") is not None and line is not None:
+        add_direction_signal("Other-book median", odds_context["consensusLine"], line)
+    implied=odds_context.get("impliedProbability") or {}
+    if selected_market_line is not None and line is not None and abs(float(line)-float(selected_market_line))<0.01:
+        add_rate_signal("Selected-book no-vig price", implied.get("over"))
+    signal_counts={side:sum(1 for signal in evidence_signals if signal["side"]==side) for side in ("OVER","UNDER","NEUTRAL")}
+    game_context = get_game_context(sport, event_id, team, opponent)
+    warnings = ["ESPN's public game-log feed can change; verify stat labels and sample before relying on it.",
+                "The displayed lean and simple projection are descriptive signals, not calibrated win probabilities or guarantees.",
+                "Opponent and injury information can be incomplete or absent from public feeds; confirm official status before using results."]
+    if not odds_context.get("available") and book:
+        warnings.append(odds_context.get("reason", "Current sportsbook comparison was unavailable."))
+    elif book and not odds_context.get("selectedBookLine"):
+        warnings.append("The selected sportsbook did not return a line for this player; any market comparison shown uses other available books in the same region.")
+    if selected_market_line is not None and line is not None and abs(float(line) - float(selected_market_line)) >= 0.01:
+        warnings.append("The entered line differs from the selected sportsbook's currently returned line.")
+    if not values:
+        warnings.append("No usable numeric game-log values were parsed for this market.")
     return jsonify({"sport": sport, "athleteId": athlete_id, "metric": metric, "metricLabel": label or metric.replace("_", " ").title(),
                     "line": line, "recentValues": recent, "sampleSize": len(season), "recentAverage": avg5,
                     "sampleAverage": avg_all, "recentMedian": median5, "projection": weighted, "difference": gap,
-                    "recentOverRate": hit_rate, "lean": lean, "dataSource": source_url or "ESPN public athlete game log",
+                    "recentOverRate": hit_rate, "last10Values": last10, "last10Average": avg10, "last10Median": median10,
+                    "recentGames": game_rows[:10],
+                    "hitRates": {"last5": recent5_hits, "last10": recent10_hits, "season": season_hits},
+                    "lean": lean, "lineSource": line_source, "book": book,
+                    "evidenceSignals": evidence_signals, "signalCounts": signal_counts,
+                    "sportsbookEvidence": odds_context, "gameContext": game_context,
+                    "dataSource": source_url or "ESPN public athlete game log",
                     "sourceLink": f"https://www.espn.com/{'nba' if sport == 'NBA' else 'nfl' if sport == 'NFL' else 'college-football'}/player/_/id/{athlete_id}",
-                    "warnings": ["ESPN's public gamelog structure can change; check the sample and labels before relying on it.",
-                                 "Projection is a simple recent/season blend, not a calibrated model or betting probability.",
-                                 "Verify the selected or manually entered line against the sportsbook before using results."] + (["No usable numeric game-log values were parsed for this metric."] if not values else [])})
+                    "warnings": warnings})
 
 
 @app.post("/api/live-game")
@@ -475,6 +548,122 @@ ODDS_MARKETS = {
  "NFL":{"passing_yards":"player_pass_yds","rushing_yards":"player_rush_yds","receiving_yards":"player_reception_yds","receptions":"player_receptions","touchdowns":"player_pass_tds"},
  "CFB":{"passing_yards":"player_pass_yds","rushing_yards":"player_rush_yds","receiving_yards":"player_reception_yds","receptions":"player_receptions","touchdowns":"player_pass_tds"},
 }
+
+def _name_key(value):
+ return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+def get_prop_market_context(sport, metric, athlete, team, opponent="", book=""):
+ """Fetch the chosen market once and use all books in its region for line comparison."""
+ api_key=os.environ.get("ODDS_API_KEY", "").strip()
+ sport_key=ODDS_SPORTS.get(sport); market_key=ODDS_MARKETS.get(sport,{}).get(metric)
+ if not api_key: return {"available":False,"reason":"Automatic sportsbook data is not configured."}
+ if not all((sport_key,market_key,athlete,team,book)):
+  return {"available":False,"reason":"Choose a supported sportsbook, player, team, and market."}
+ region="us_dfs" if book=="prizepicks" else "us"
+ try:
+  events=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events",{"apiKey":api_key},cache_seconds=60)
+  def has_team(event, name):
+   home=_name_key(event.get("home_team")); away=_name_key(event.get("away_team"))
+   tokens=[_name_key(part) for part in str(name).split() if len(_name_key(part))>=4]
+   return any(value and (value in home or value in away) for value in [_name_key(name),*tokens])
+  candidates=[event for event in events if has_team(event,team)]
+  if opponent:
+   same_match=[event for event in candidates if has_team(event,opponent)]
+   if not same_match:
+    return {"available":False,"reason":"No sportsbook event matched both teams in the selected game."}
+   candidates=same_match
+  if not candidates:
+   return {"available":False,"reason":"The Odds API has no matching upcoming/live event for this player."}
+  event=candidates[0]
+  odds=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event['id']}/odds",
+   {"apiKey":api_key,"regions":region,"markets":market_key,"oddsFormat":"american"},cache_seconds=45)
+  player_key=_name_key(athlete); grouped={}
+  for bookmaker in odds.get("bookmakers",[]):
+   for market in bookmaker.get("markets",[]):
+    if market.get("key")!=market_key: continue
+    for outcome in market.get("outcomes",[]):
+     named_player=outcome.get("description") or outcome.get("player") or ""
+     if not named_player and _name_key(outcome.get("name"))==player_key: named_player=outcome.get("name")
+     if _name_key(named_player)!=player_key or outcome.get("point") is None: continue
+     try: point=float(outcome["point"])
+     except (TypeError,ValueError): continue
+     key=(bookmaker.get("key", ""),point)
+     row=grouped.setdefault(key,{"book":bookmaker.get("title") or bookmaker.get("key"),"bookKey":bookmaker.get("key"),
+                                "line":point,"overPrice":None,"underPrice":None,"lastUpdate":market.get("last_update")})
+     side=str(outcome.get("name") or "").lower()
+     if "over" in side: row["overPrice"]=outcome.get("price")
+     elif "under" in side: row["underPrice"]=outcome.get("price")
+  # Standard player props return an over/under pair at the same point. If an
+  # operator lists alternate thresholds, prefer the first complete pair.
+  by_book={}
+  for row in grouped.values():
+   by_book.setdefault(row["bookKey"],[]).append(row)
+  lines=[]
+  for options in by_book.values():
+   paired=[row for row in options if row["overPrice"] is not None and row["underPrice"] is not None]
+   lines.append((paired or options)[0])
+  lines.sort(key=lambda row:(row["book"].lower(),row["line"]))
+  selected=next((row for row in lines if row["bookKey"]==book),None)
+  points=[row["line"] for row in lines]
+  consensus=round(statistics.median(points),2) if points else None
+  implied=None
+  if selected and selected["overPrice"] is not None and selected["underPrice"] is not None:
+   def implied_probability(price):
+    price=float(price)
+    return (-price)/(-price+100) if price<0 else 100/(price+100)
+   over_p=implied_probability(selected["overPrice"]); under_p=implied_probability(selected["underPrice"])
+   implied={"over":round(over_p/(over_p+under_p)*100,1),"under":round(under_p/(over_p+under_p)*100,1),"method":"two-way market odds, normalized to remove vig"}
+  return {"available":bool(lines),"region":region,"event":event.get("away_team","")+" at "+event.get("home_team",""),
+          "market":market_key,"source":"The Odds API","sourceUrl":"https://the-odds-api.com/liveapi/guides/v4/",
+          "selectedBookLine":selected,"bookLines":lines,"bookmakerCount":len(lines),"consensusLine":consensus,
+          "lineRange":[min(points),max(points)] if points else None,"impliedProbability":implied,
+          "updatedAt":max((row.get("lastUpdate") or "" for row in lines),default="") or None,
+          "reason":"No player prop quotes were returned for this event and market." if not lines else ""}
+ except requests.HTTPError as exc:
+  status=getattr(getattr(exc,"response",None),"status_code",502)
+  return {"available":False,"reason":f"Sportsbook provider request failed (HTTP {status})."}
+ except Exception:
+  return {"available":False,"reason":"Could not retrieve sportsbook market data."}
+
+def get_game_context(sport, event_id, team="", opponent=""):
+ if not event_id: return {"available":False,"reason":"No selected ESPN game was attached to this player."}
+ spec=SPORTS[sport]
+ try:
+  data=fetch_json(f"{ESPN_SITE}/{spec['path']}/summary",{"event":event_id},cache_seconds=60)
+  header=data.get("header") or {}
+  competition=(header.get("competitions") or [{}])[0]
+  competitors=competition.get("competitors") or []
+  names=[]; selected_team=None; found_opponent=""
+  for competitor in competitors:
+   team_data=competitor.get("team") or {}
+   name=team_data.get("displayName") or team_data.get("name") or ""
+   if name: names.append(name)
+   if team and _name_key(team) in _name_key(name): selected_team=competitor
+  if selected_team:
+   found_opponent=next((item.get("team",{}).get("displayName") or item.get("team",{}).get("name") or "" for item in competitors if item is not selected_team),"")
+  injuries=[]; injury_feed_returned=False
+  for competitor in competitors:
+   competitor_team=competitor.get("team") or {}
+   competitor_name=competitor_team.get("displayName") or competitor_team.get("name") or ""
+   if "injuries" in competitor: injury_feed_returned=True
+   for item in competitor.get("injuries") or []:
+    athlete_data=item.get("athlete") or {}
+    name=athlete_data.get("displayName") or athlete_data.get("fullName") or ""
+    status=item.get("status") or item.get("type") or ""
+    details=item.get("details") or {}
+    if isinstance(details,dict): status=status or details.get("detail") or details.get("type") or ""
+    if name: injuries.append({"team":competitor_name,"name":name,"status":str(status)})
+  status_obj=competition.get("status") or {}
+  status_type=status_obj.get("type") or {}
+  event_date=competition.get("date") or header.get("competitions",[{}])[0].get("date")
+  return {"available":True,"teams":names,"team":team,"opponent":found_opponent or opponent,
+          "status":status_type.get("shortDetail") or status_type.get("detail") or "Status unavailable",
+          "date":event_date,"venue":(competition.get("venue") or {}).get("fullName"),"injuries":injuries,
+          "injuryFeedReturned":injury_feed_returned,
+          "source":"ESPN game summary","sourceUrl":f"https://www.espn.com/{'nba' if sport=='NBA' else 'nfl' if sport=='NFL' else 'college-football'}/game?gameId={event_id}"}
+ except Exception:
+  return {"available":False,"reason":"ESPN did not return game context for this matchup."}
+
 @app.post("/api/prop-line")
 def prop_line():
  body=request.get_json(silent=True) or {}
@@ -482,36 +671,21 @@ def prop_line():
  athlete=re.sub(r"\s+"," ",str(body.get("player","")).strip()).lower()
  team=re.sub(r"\s+"," ",str(body.get("team","")).strip()).lower()
  book=re.sub(r"[^a-z0-9_]","",str(body.get("book","")).lower())
- api_key=os.environ.get("ODDS_API_KEY","").strip()
- if not api_key: return jsonify({"error":"Automatic lines are not connected yet. Add ODDS_API_KEY to Render, then redeploy."}),503
- sport_key=ODDS_SPORTS.get(sport); market_key=ODDS_MARKETS.get(sport,{}).get(metric)
- if not all((sport_key,market_key,athlete,book,team)):
-  return jsonify({"error":"This sport, market, player, team, or sportsbook is not supported for automatic lines."}),400
- def norm(value): return re.sub(r"[^a-z0-9]","",str(value or "").lower())
- try:
-  events=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events",{"apiKey":api_key},cache_seconds=60)
-  team_key=norm(team)
-  candidates=[e for e in events if team_key and (team_key in norm(e.get("home_team")) or team_key in norm(e.get("away_team")))]
-  if not candidates:
-   tokens=[norm(token) for token in team.split() if len(norm(token))>=4]
-   candidates=[e for e in events if any(t in norm(e.get("home_team")) or t in norm(e.get("away_team")) for t in tokens)]
-  for event in candidates[:2]:
-   odds=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event['id']}/odds",
-    {"apiKey":api_key,"regions":"us_dfs" if book=="prizepicks" else "us","markets":market_key,"bookmakers":book,"oddsFormat":"american"},cache_seconds=45)
-   for bm in odds.get("bookmakers",[]):
-    if bm.get("key")!=book: continue
-    for market in bm.get("markets",[]):
-     if market.get("key")!=market_key: continue
-     for outcome in market.get("outcomes",[]):
-      if norm(outcome.get("description") or outcome.get("name"))==norm(athlete) and outcome.get("point") is not None:
-       return jsonify({"line":outcome["point"],"book":bm.get("title") or book,"market":market.get("title") or market_key,
-        "event":event.get("away_team","")+" at "+event.get("home_team",""),"updatedAt":odds.get("last_update"),"source":"The Odds API"})
-  return jsonify({"error":"No current line was found for this player at that book. The game, market, or player prop may not be posted yet."}),404
- except requests.HTTPError as exc:
-  status=getattr(getattr(exc,"response",None),"status_code",502)
-  return jsonify({"error":f"Odds provider request failed (HTTP {status}). Check the Render key and provider access."}),502
- except Exception as exc:
-  return jsonify({"error":f"Could not retrieve the current line ({type(exc).__name__})."}),502
+ context=get_prop_market_context(sport,metric,athlete,team,str(body.get("opponent", "")),book)
+ chosen=context.get("selectedBookLine")
+ if not context.get("available"):
+  return jsonify({"error":context.get("reason") or "No current player prop quotes were returned.","bookLines":context.get("bookLines",[]),
+                  "consensusLine":context.get("consensusLine"),"event":context.get("event"),"source":context.get("source","The Odds API")}),404
+ if not chosen:
+  available_books=", ".join(row["book"] for row in context.get("bookLines",[])) or "none"
+  return jsonify({"error":f"No line was found at the selected book. Available books in this market: {available_books}.",
+                  "bookLines":context.get("bookLines",[]),"consensusLine":context.get("consensusLine"),
+                  "lineRange":context.get("lineRange"),"event":context.get("event"),"source":context.get("source")}),404
+ return jsonify({"line":chosen["line"],"book":chosen["book"],"market":context["market"],"event":context["event"],
+                 "updatedAt":chosen.get("lastUpdate"),"source":context["source"],"sourceUrl":context["sourceUrl"],
+                 "bookLines":context["bookLines"],"bookmakerCount":context["bookmakerCount"],
+                 "consensusLine":context["consensusLine"],"lineRange":context["lineRange"],
+                 "impliedProbability":context["impliedProbability"]})
 
 @app.get("/robots.txt")
 def robots():
