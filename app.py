@@ -377,6 +377,65 @@ def player_research():
                                  "The line is entered by you; this tool does not claim to fetch live player-prop odds."] + (["No usable numeric game-log values were parsed for this metric."] if not values else [])})
 
 
+@app.post("/api/live-game")
+def live_game():
+    body = request.get_json(silent=True) or {}
+    sport = str(body.get("sport", "")).upper()
+    event_id = re.sub(r"[^0-9]", "", str(body.get("eventId", "")))
+    if sport not in SPORTS or not event_id:
+        return jsonify({"error": "Choose a sport and game first."}), 400
+    spec = SPORTS[sport]
+    try:
+        data = fetch_json(f"{ESPN_SITE}/{spec['path']}/summary", {"event": event_id}, cache_seconds=10)
+        box = data.get("boxscore") or {}
+        header = data.get("header") or {}
+        competition = (header.get("competitions") or [{}])[0]
+        status_obj = competition.get("status") or {}
+        status_type = status_obj.get("type") or {}
+        status = status_type.get("shortDetail") or status_type.get("detail") or status_obj.get("displayClock") or "Live stats"
+        competitors = competition.get("competitors") or []
+        scoreboard = {str(x.get("id")): x for x in competitors}
+        teams = []
+        for team_box in box.get("teams") or []:
+            team = team_box.get("team") or {}
+            team_id = str(team.get("id") or "")
+            board = scoreboard.get(team_id) or {}
+            teams.append({"id": team_id, "name": team.get("displayName") or team.get("name") or "Team",
+                          "abbreviation": team.get("abbreviation") or "", "score": board.get("score") or "—",
+                          "homeAway": team_box.get("homeAway") or board.get("homeAway") or ""})
+        players_by_team = []
+        for group in box.get("players") or []:
+            team = group.get("team") or {}
+            team_id = str(team.get("id") or "")
+            normalized = []
+            for category in group.get("statistics") or []:
+                labels = category.get("labels") or category.get("names") or []
+                keys = category.get("keys") or []
+                descriptions = category.get("descriptions") or []
+                for entry in category.get("athletes") or []:
+                    athlete = entry.get("athlete") or {}
+                    if not athlete.get("id"):
+                        continue
+                    values = entry.get("stats") or []
+                    stat_rows = []
+                    for index, label in enumerate(labels):
+                        value = values[index] if index < len(values) else "—"
+                        if value is None or str(value).strip() == "":
+                            value = "—"
+                        stat_rows.append({"label": str(label), "key": str(keys[index]) if index < len(keys) else str(label),
+                                          "description": str(descriptions[index]) if index < len(descriptions) else str(label),
+                                          "value": str(value)})
+                    normalized.append({"id": str(athlete["id"]), "name": athlete.get("displayName") or athlete.get("shortName") or "Player",
+                                       "position": (athlete.get("position") or {}).get("abbreviation", "") if isinstance(athlete.get("position"), dict) else "",
+                                       "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
+                                       "starter": bool(entry.get("starter")), "didNotPlay": bool(entry.get("didNotPlay")), "stats": stat_rows})
+            players_by_team.append({"teamId": team_id, "players": normalized})
+        return jsonify({"sport": sport, "eventId": event_id, "status": status, "teams": teams, "playersByTeam": players_by_team,
+                        "generatedAt": datetime.now(timezone.utc).isoformat(), "source": "ESPN public box score"})
+    except Exception as exc:
+        return jsonify({"error": f"Live box score unavailable ({type(exc).__name__}). Try refreshing shortly."}), 502
+
+
 @app.get("/robots.txt")
 def robots():
     return "User-agent: *\nDisallow:\n", 200, {"Content-Type": "text/plain"}
