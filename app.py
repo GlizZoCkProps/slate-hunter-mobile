@@ -483,11 +483,11 @@ def live_game():
             teams.append({"id": team_id, "name": team.get("displayName") or team.get("name") or "Team",
                           "abbreviation": team.get("abbreviation") or "", "score": board.get("score") or "—",
                           "homeAway": team_box.get("homeAway") or board.get("homeAway") or ""})
-        players_by_team = []
+        players_by_team = {}
         for group in box.get("players") or []:
             team = group.get("team") or {}
             team_id = str(team.get("id") or "")
-            normalized = []
+            normalized = players_by_team.setdefault(team_id, {})
             for category in group.get("statistics") or []:
                 labels = category.get("labels") or category.get("names") or []
                 keys = category.get("keys") or []
@@ -505,51 +505,40 @@ def live_game():
                         stat_rows.append({"label": str(label), "key": str(keys[index]) if index < len(keys) else str(label),
                                           "description": str(descriptions[index]) if index < len(descriptions) else str(label),
                                           "value": str(value)})
-                    normalized.append({"id": str(athlete["id"]), "name": athlete.get("displayName") or athlete.get("shortName") or "Player",
-                                       "position": (athlete.get("position") or {}).get("abbreviation", "") if isinstance(athlete.get("position"), dict) else "",
-                                       "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
-                                       "starter": bool(entry.get("starter")), "didNotPlay": bool(entry.get("didNotPlay")),
-                                       "availability": "", "injuries": [], "stats": stat_rows})
-            if normalized:
-                players_by_team.append({"teamId": team_id, "players": normalized})
+                    player_id = str(athlete["id"])
+                    player = normalized.setdefault(player_id, {"id": player_id,
+                        "name": athlete.get("displayName") or athlete.get("shortName") or "Player",
+                        "position": (athlete.get("position") or {}).get("abbreviation", "") if isinstance(athlete.get("position"), dict) else "",
+                        "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
+                        "starter": False, "didNotPlay": False, "stats": [], "_statKeys": set()})
+                    player["starter"] = player["starter"] or bool(entry.get("starter"))
+                    player["didNotPlay"] = player["didNotPlay"] or bool(entry.get("didNotPlay"))
+                    for stat in stat_rows:
+                        if stat["value"] != "—" and stat["key"] not in player["_statKeys"]:
+                            player["stats"].append(stat)
+                            player["_statKeys"].add(stat["key"])
+        # ESPN's box score is the source of game-specific participants. Never
+        # substitute the full team roster when a pregame lineup is unavailable.
+        normalized_groups = []
+        for team in teams:
+            players = list(players_by_team.get(team["id"], {}).values())
+            players = [player for player in players if not player["didNotPlay"]]
+            for player in players:
+                player.pop("_statKeys", None)
+            normalized_groups.append({"teamId": team["id"], "players": players})
+        players_by_team = normalized_groups
         has_game_players = any(group.get("players") for group in players_by_team)
-        roster_errors = []
-        if not has_game_players:
-            players_by_team = []
-            for team in teams:
-                try:
-                    roster = fetch_json(f"{ESPN_SITE}/{spec['path']}/teams/{team['id']}/roster", cache_seconds=60)
-                    roster_players = []
-                    for roster_group in roster.get("athletes") or []:
-                        if not isinstance(roster_group, dict):
-                            continue
-                        # ESPN groups many team rosters by position and nests the
-                        # actual athletes under each group's `items` array.
-                        entries = roster_group.get("items")
-                        if not isinstance(entries, list):
-                            entries = [roster_group]
-                        for athlete in entries:
-                            if not isinstance(athlete, dict) or not athlete.get("id"):
-                                continue
-                            position = athlete.get("position") or roster_group.get("position") or {}
-                            athlete_status = athlete.get("status") or {}
-                            roster_players.append({"id": str(athlete["id"]), "name": athlete.get("displayName") or athlete.get("fullName") or "Player",
-                                                   "position": position.get("abbreviation") or position.get("displayName", "") if isinstance(position, dict) else str(position),
-                                                   "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
-                                                   "starter": False, "didNotPlay": False,
-                                                   "availability": athlete_status.get("abbreviation") or athlete_status.get("displayName") or athlete_status.get("name") or "",
-                                                   "injuries": athlete.get("injuries") or [], "stats": []})
-                    players_by_team.append({"teamId": team["id"], "players": roster_players})
-                except Exception as roster_exc:
-                    roster_errors.append(f"{team['name']}: {type(roster_exc).__name__}")
-                    players_by_team.append({"teamId": team["id"], "players": []})
         game_state, completed, _ = event_status({"status": status_obj})
+        if completed:
+            for group in players_by_team:
+                group["players"] = [player for player in group["players"] if player.get("stats")]
+            has_game_players = any(group.get("players") for group in players_by_team)
         return jsonify({"sport": sport, "eventId": event_id, "status": status, "teams": teams, "playersByTeam": players_by_team,
                         "rosterOnly": not has_game_players, "lineupConfirmed": has_game_players,
                         "gameState": game_state, "completed": completed, "isLive": game_state == "in",
-                        "rosterMessage": "Current team rosters shown; ESPN has not posted the confirmed game lineup yet." if not has_game_players else "Players listed from this game's box score.",
-                        "rosterErrors": roster_errors, "generatedAt": datetime.now(timezone.utc).isoformat(),
-                        "source": "ESPN public box score and team roster" if not has_game_players else "ESPN public box score"})
+                        "rosterMessage": "ESPN has not posted game-specific player lineups yet. Full team rosters are hidden until participants are available." if not has_game_players else "Players listed from this game's box score; DNP players are hidden.",
+                        "generatedAt": datetime.now(timezone.utc).isoformat(),
+                        "source": "ESPN public box score"})
     except Exception as exc:
         return jsonify({"error": f"Game players unavailable ({type(exc).__name__}). Try refreshing shortly."}), 502
 
