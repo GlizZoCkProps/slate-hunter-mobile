@@ -177,47 +177,51 @@ def get_search_items(data, sport=None):
         unique[item["id"]] = item
     return list(unique.values())[:15]
 def flatten_stat_labels(data):
-    """Return stat labels and numeric row values from ESPN's variably-shaped gamelog payload."""
-    labels, rows = [], []
-    if not isinstance(data, dict): return labels, rows
-    # ESPN common v3 gamelog commonly has labels in names/labels and events in events/categories.
-    for key in ("labels", "names", "displayNames", "statistics"):
-        val = data.get(key)
-        if isinstance(val, list) and val and all(isinstance(x, (str, int, float)) for x in val):
-            labels = [str(x) for x in val]
+    """Return ESPN's stat labels and per-game rows across common gamelog shapes."""
+    if not isinstance(data, dict): return [], []
+    labels = []
+    for key in ("displayNames", "names", "labels"):
+        value = data.get(key)
+        if isinstance(value, list) and value and all(isinstance(x, (str, int, float)) for x in value):
+            labels = [str(x) for x in value]
             break
-    for container_key in ("events", "seasonTypes", "splits", "categories", "statistics"):
-        val = data.get(container_key)
-        if isinstance(val, list):
-            for item in val:
-                if isinstance(item, dict):
-                    stat_values = item.get("stats") or item.get("statistics") or item.get("values")
-                    if isinstance(stat_values, list):
-                        vals = []
-                        for x in stat_values:
-                            if isinstance(x, dict): vals.append(x.get("displayValue", x.get("value", x.get("stat"))))
-                            else: vals.append(x)
-                        if vals: rows.append({"label": item.get("displayName") or item.get("name") or item.get("date") or "Game", "values": vals, "raw": item})
-    # Some gamelog responses nest events under items or content.
+
+    rows = []
+    event_metadata = data.get("events") if isinstance(data.get("events"), dict) else {}
+    # Current ESPN common-v3 format: seasonTypes -> categories -> events.
+    for season_type in data.get("seasonTypes") or []:
+        if not isinstance(season_type, dict): continue
+        for category in season_type.get("categories") or []:
+            if not isinstance(category, dict): continue
+            for event_row in category.get("events") or []:
+                if not isinstance(event_row, dict) or not isinstance(event_row.get("stats"), list): continue
+                event_id = str(event_row.get("eventId") or event_row.get("id") or "")
+                metadata = event_metadata.get(event_id, {}) if isinstance(event_metadata, dict) else {}
+                opponent = metadata.get("opponent") or {}
+                if isinstance(opponent, dict): opponent = opponent.get("displayName") or opponent.get("name") or ""
+                date = metadata.get("gameDate") or metadata.get("date") or ""
+                if date:
+                    try: date = datetime.fromisoformat(str(date).replace("Z", "+00:00")).strftime("%b %d")
+                    except Exception: date = str(date)[:10]
+                label = date or (f"Week {metadata['week']}" if metadata.get("week") else "Game")
+                rows.append({"label": label, "values": event_row["stats"],
+                             "raw": {**event_row, "opponent": opponent}})
+
+    # Keep compatibility with older ESPN payloads while avoiding season totals
+    # in the current format, which would otherwise get counted as extra games.
     if not rows:
         def walk(obj):
             if isinstance(obj, dict):
-                vals = obj.get("stats") or obj.get("statistics")
-                if isinstance(vals, list):
-                    values = [v.get("displayValue", v.get("value")) if isinstance(v, dict) else v for v in vals]
-                    if values: rows.append({"label": obj.get("displayName") or obj.get("name") or obj.get("date") or "Game", "values": values, "raw": obj})
-                for v in obj.values():
-                    if isinstance(v, (dict, list)): walk(v)
+                vals = obj.get("stats") or obj.get("statistics") or obj.get("values")
+                if isinstance(vals, list) and vals:
+                    values = [v.get("displayValue", v.get("value", v.get("stat"))) if isinstance(v, dict) else v for v in vals]
+                    rows.append({"label": obj.get("displayName") or obj.get("name") or obj.get("date") or "Game", "values": values, "raw": obj})
+                for value in obj.values():
+                    if isinstance(value, (dict, list)): walk(value)
             elif isinstance(obj, list):
-                for v in obj: walk(v)
+                for value in obj: walk(value)
         walk(data)
-    if not labels:
-        # Common gamelog includes names nested in seasonTypes.categories.
-        cats = data.get("categories")
-        if isinstance(cats, list): labels = [str(c.get("displayName") or c.get("name") or c.get("abbreviation") or "Stat") for c in cats if isinstance(c, dict)]
     return labels, rows
-
-
 def athlete_profile(sport, athlete_id):
     spec = SPORTS[sport]
     urls = [
@@ -247,8 +251,8 @@ def choose_metric(sport, metric, labels, rows):
     aliases = {
         "points": ["points", "pts"], "rebounds": ["rebounds", "reb", "total rebounds"],
         "assists": ["assists", "ast"], "minutes": ["minutes", "min"],
-        "passing_yards": ["passing yards", "pass yards", "yds"],
-        "rushing_yards": ["rushing yards", "rush yards"], "receiving_yards": ["receiving yards", "rec yards"],
+        "passing_yards": ["passing yards", "pass yards", "passingYards"],
+        "rushing_yards": ["rushing yards", "rush yards", "rushingYards"], "receiving_yards": ["receiving yards", "rec yards", "receivingYards"],
         "receptions": ["receptions", "rec"], "touchdowns": ["touchdowns", "td"],
         "three_pointers": ["3-point field goals made", "three pointers made", "3pm", "3pt made"],
         "steals": ["steals", "stl"], "blocks": ["blocks", "blk"], "turnovers": ["turnovers", "to"],
@@ -586,7 +590,7 @@ def get_prop_market_context(sport, metric, athlete, team, opponent="", book=""):
    return {"available":False,"reason":"The Odds API has no matching upcoming/live event for this player."}
   event=candidates[0]
   odds=fetch_json(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event['id']}/odds",
-   {"apiKey":api_key,"regions":region,"markets":market_key,"oddsFormat":"american"},cache_seconds=45)
+   {"apiKey":api_key,"regions":region,"markets":market_key,"oddsFormat":"american"},cache_seconds=300)
   player_key=_name_key(athlete); grouped={}
   for bookmaker in odds.get("bookmakers",[]):
    for market in bookmaker.get("markets",[]):
