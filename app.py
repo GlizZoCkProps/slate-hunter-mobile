@@ -392,11 +392,14 @@ def live_game():
         competition = (header.get("competitions") or [{}])[0]
         status_obj = competition.get("status") or {}
         status_type = status_obj.get("type") or {}
-        status = status_type.get("shortDetail") or status_type.get("detail") or status_obj.get("displayClock") or "Live stats"
+        status = status_type.get("shortDetail") or status_type.get("detail") or status_obj.get("displayClock") or "Game status unavailable"
         competitors = competition.get("competitors") or []
-        scoreboard = {str(x.get("id")): x for x in competitors}
+        scoreboard = {str((x.get("team") or {}).get("id") or x.get("id")): x for x in competitors}
+        team_boxes = box.get("teams") or []
+        if not team_boxes:
+            team_boxes = [{"team": x.get("team") or {}, "homeAway": x.get("homeAway", "")} for x in competitors]
         teams = []
-        for team_box in box.get("teams") or []:
+        for team_box in team_boxes:
             team = team_box.get("team") or {}
             team_id = str(team.get("id") or "")
             board = scoreboard.get(team_id) or {}
@@ -428,12 +431,40 @@ def live_game():
                     normalized.append({"id": str(athlete["id"]), "name": athlete.get("displayName") or athlete.get("shortName") or "Player",
                                        "position": (athlete.get("position") or {}).get("abbreviation", "") if isinstance(athlete.get("position"), dict) else "",
                                        "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
-                                       "starter": bool(entry.get("starter")), "didNotPlay": bool(entry.get("didNotPlay")), "stats": stat_rows})
-            players_by_team.append({"teamId": team_id, "players": normalized})
+                                       "starter": bool(entry.get("starter")), "didNotPlay": bool(entry.get("didNotPlay")),
+                                       "availability": "", "injuries": [], "stats": stat_rows})
+            if normalized:
+                players_by_team.append({"teamId": team_id, "players": normalized})
+        has_game_players = any(group.get("players") for group in players_by_team)
+        roster_errors = []
+        if not has_game_players:
+            players_by_team = []
+            for team in teams:
+                try:
+                    roster = fetch_json(f"{ESPN_SITE}/{spec['path']}/teams/{team['id']}/roster", cache_seconds=60)
+                    roster_players = []
+                    for athlete in roster.get("athletes") or []:
+                        if not athlete.get("id"):
+                            continue
+                        position = athlete.get("position") or {}
+                        athlete_status = athlete.get("status") or {}
+                        roster_players.append({"id": str(athlete["id"]), "name": athlete.get("displayName") or athlete.get("fullName") or "Player",
+                                               "position": position.get("abbreviation", "") if isinstance(position, dict) else "",
+                                               "headshot": (athlete.get("headshot") or {}).get("href", "") if isinstance(athlete.get("headshot"), dict) else "",
+                                               "starter": False, "didNotPlay": False,
+                                               "availability": athlete_status.get("abbreviation") or athlete_status.get("name") or "",
+                                               "injuries": athlete.get("injuries") or [], "stats": []})
+                    players_by_team.append({"teamId": team["id"], "players": roster_players})
+                except Exception as roster_exc:
+                    roster_errors.append(f"{team['name']}: {type(roster_exc).__name__}")
+                    players_by_team.append({"teamId": team["id"], "players": []})
         return jsonify({"sport": sport, "eventId": event_id, "status": status, "teams": teams, "playersByTeam": players_by_team,
-                        "generatedAt": datetime.now(timezone.utc).isoformat(), "source": "ESPN public box score"})
+                        "rosterOnly": not has_game_players, "lineupConfirmed": has_game_players,
+                        "rosterMessage": "Current team rosters shown; ESPN has not posted the confirmed game lineup yet." if not has_game_players else "Players listed from this game's box score.",
+                        "rosterErrors": roster_errors, "generatedAt": datetime.now(timezone.utc).isoformat(),
+                        "source": "ESPN public box score and team roster" if not has_game_players else "ESPN public box score"})
     except Exception as exc:
-        return jsonify({"error": f"Live box score unavailable ({type(exc).__name__}). Try refreshing shortly."}), 502
+        return jsonify({"error": f"Game players unavailable ({type(exc).__name__}). Try refreshing shortly."}), 502
 
 
 @app.get("/robots.txt")
