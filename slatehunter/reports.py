@@ -81,6 +81,46 @@ def paper_summary(conn):
             FROM paper_picks GROUP BY 1""")
 
 
+def source_comparison(conn, since_utc=None, window_min=30):
+    """Compare The Odds API snapshots with the nearest PropLine snapshot for the same
+    game/book/market/player/side taken within `window_min` minutes."""
+    where, params = "", []
+    if since_utc:
+        where, params = "AND a.collected_at_utc >= ?", [since_utc]
+    pairs = rows(conn, f"""
+        SELECT a.book_key, a.market, a.line a_line, a.price_american a_price, b.line b_line, b.price_american b_price,
+               ABS(julianday(a.collected_at_utc) - julianday(b.collected_at_utc)) * 1440 gap_min
+        FROM prop_snapshots a JOIN prop_snapshots b
+          ON b.source='propline' AND b.game_id=a.game_id AND b.book_key=a.book_key AND b.market=a.market
+         AND b.player_key=a.player_key AND b.side=a.side
+         AND ABS(julianday(a.collected_at_utc) - julianday(b.collected_at_utc)) * 1440 <= ?
+        WHERE a.source='the_odds_api' AND a.game_id IS NOT NULL {where}""", [window_min] + params)
+    out = {}
+    for p in pairs:
+        o = out.setdefault(p["book_key"], {"book_key": p["book_key"], "pairs": 0, "same_line": 0, "line_diffs": [], "same_price": 0, "priced": 0})
+        o["pairs"] += 1
+        if p["a_line"] == p["b_line"]:
+            o["same_line"] += 1
+        if p["a_line"] is not None and p["b_line"] is not None:
+            o["line_diffs"].append(abs(p["a_line"] - p["b_line"]))
+        if p["a_price"] is not None and p["b_price"] is not None:
+            o["priced"] += 1
+            o["same_price"] += p["a_price"] == p["b_price"]
+    result = []
+    for o in out.values():
+        d = o.pop("line_diffs")
+        o["same_line_pct"] = round(o["same_line"] / o["pairs"], 3) if o["pairs"] else None
+        o["mean_abs_line_diff"] = round(sum(d) / len(d), 3) if d else None
+        o["same_price_pct"] = round(o["same_price"] / o["priced"], 3) if o["priced"] else None
+        result.append(o)
+    return sorted(result, key=lambda x: x["book_key"])
+
+
+def source_coverage(conn, since_utc):
+    return rows(conn, """SELECT source, sport, book_key, COUNT(DISTINCT game_id) games, COUNT(*) snapshots
+                         FROM prop_snapshots WHERE collected_at_utc >= ? GROUP BY 1,2,3 ORDER BY 1,2,3""", (since_utc,))
+
+
 def candidates(conn, now=None, limit=50):
     """Latest line per (book, player, market) for upcoming games next to the latest
     projection. `gap` = projection - line. Descriptive only: not a probability."""
@@ -165,6 +205,14 @@ def daily_report(conn, now=None):
     for c in candidates(conn, now, limit=25):
         L.append(f"| {c['game']} {c['start_time_ct'][:16] if c['start_time_ct'] else ''} | {c['book_key']} | {c['player_name']} | {c['market']} | "
                  f"{c['line']} | {c['over_price']}/{c['under_price']} | {c['projection']} | {c['gap']} | {c['injury_status'] or ''} | {c['snapshot_id']} |")
+    L += ["", "## Sources, last 24h (games and snapshots per source/book)", "",
+          "| source | sport | book | games | snapshots |", "|---|---|---|---|---|"]
+    for r in source_coverage(conn, iso_utc(now - timedelta(hours=24))):
+        L.append(f"| {r['source']} | {r['sport']} | {r['book_key']} | {r['games']} | {r['snapshots']} |")
+    L += ["", "## Source agreement, last 7 days (Odds API vs PropLine, same book/player/side, snapshots ≤30 min apart)", "",
+          "| book | pairs | same line | mean abs line diff | same price (priced pairs) |", "|---|---|---|---|---|"]
+    for r in source_comparison(conn, iso_utc(now - timedelta(days=7))):
+        L.append(f"| {r['book_key']} | {r['pairs']} | {r['same_line_pct']} | {r['mean_abs_line_diff']} | {r['same_price_pct']} ({r['priced']}) |")
     moves = rows(conn, "SELECT * FROM market_signals WHERE observed_at_utc>=? ORDER BY id DESC LIMIT 25", (iso_utc(now - timedelta(hours=24)),))
     L += ["", "## Line/price moves observed, last 24h", "",
           "Observed changes between our own snapshots. Not evidence of sharp money: no ticket/handle data unless a row says `reported_split` with a source URL.", ""]

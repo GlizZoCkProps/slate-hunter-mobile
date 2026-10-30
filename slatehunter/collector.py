@@ -10,7 +10,7 @@ from datetime import timedelta
 
 from . import __version__
 from .config import iso_ct, iso_utc, parse_iso, utc_now, CENTRAL
-from .sources import espn, odds_api
+from .sources import espn, odds_api, propline
 from .util import team_key
 
 SOURCE_ESPN = "espn_public_api"
@@ -308,6 +308,89 @@ def collect_props(conn, cfg, http, now=None):
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (run.id, ts_utc, ts_ct, SOURCE_ODDS, x["book_key"], x["book_title"], x["region"], sport,
                      game["id"] if game else None, ev["id"], iso_utc(start), x["market"], x["source_market_key"],
+                     x["player_name"], x["player_key"], x["side"], x["line"], x["price_american"], x["book_last_update"]))
+                run.items += cur.rowcount
+            conn.commit()
+        if not candidates:
+            run.message = f"no games starting before {iso_utc(horizon)}"
+        detect_moves(conn, run.id)
+        conn.commit()
+    return run
+
+
+def _last_propline_quota(conn, now):
+    """Remaining PropLine requests today, from the latest run on the same UTC day."""
+    row = conn.execute("SELECT quota_remaining, started_at_utc FROM collection_runs WHERE job='collect_props_propline' "
+                       "AND quota_remaining IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+    if row and row["started_at_utc"][:10] == iso_utc(now)[:10]:
+        return row["quota_remaining"]
+    return None  # new day or never called: PropLine's daily quota has reset
+
+
+def collect_props_propline(conn, cfg, http, now=None):
+    """Snapshot props from PropLine for every game starting within the lookahead,
+    soonest first. Stored with source='propline' and odds_event_id 'pl:<id>' so the
+    two sources stay distinguishable for comparison and line-move detection."""
+    now = now or utc_now()
+    with Run(conn, "collect_props_propline", now) as run:
+        if not cfg.propline_api_key:
+            run.skip("PROPLINE_API_KEY not configured")
+            return run
+        remaining = _last_propline_quota(conn, now)
+        horizon = now + timedelta(hours=cfg.propline_lookahead_hours)
+        candidates = []
+        for sport in cfg.sports:
+            if sport not in propline.SPORT_KEYS:
+                continue
+            try:
+                evs, headers = propline.events(http, cfg.propline_api_key, sport)
+            except Exception as exc:
+                run.error(propline.SOURCE, f"{sport} events", exc)
+                continue
+            r, u = propline.quota(headers)
+            if r is not None:
+                remaining, run.quota_remaining, run.quota_used = r, r, u
+            for ev in evs or []:
+                start = parse_iso(ev.get("commence_time"))
+                if start and now < start <= horizon:
+                    candidates.append((start, sport, ev))
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        done = 0
+        for start, sport, ev in candidates:
+            scope = f"{sport} {ev.get('away_team')} at {ev.get('home_team')} (pl:{ev.get('id')})"
+            if done >= cfg.propline_max_events_per_run:
+                run.log("missing", propline.SOURCE, scope, "RunCapReached", f"SLATE_PROPLINE_MAX_EVENTS_PER_RUN={cfg.propline_max_events_per_run} reached")
+                continue
+            if remaining is not None and remaining - 1 < cfg.propline_request_reserve:
+                run.log("missing", propline.SOURCE, scope, "RequestReserve",
+                        f"skipped: {remaining} PropLine requests left today, reserve {cfg.propline_request_reserve}")
+                continue
+            markets = odds_api.DEFAULT_MARKETS[sport]
+            provider = [odds_api.MARKETS[sport][m] for m in markets]
+            try:
+                data, headers = propline.event_odds(http, cfg.propline_api_key, sport, ev["id"], provider, cfg.books)
+            except Exception as exc:
+                run.error(propline.SOURCE, scope, exc)
+                continue
+            done += 1
+            r, u = propline.quota(headers)
+            if r is not None:
+                remaining, run.quota_remaining, run.quota_used = r, r, u
+            game = match_game(conn, sport, ev.get("home_team"), ev.get("away_team"), ev.get("commence_time"))
+            if game is None:
+                run.log("missing", propline.SOURCE, scope, "NoEspnMatch", "no ESPN game matched; snapshots stored with game_id NULL")
+            rows, skipped_alt = propline.parse_event_odds(data, sport)
+            for b in cfg.books:
+                if b not in {x["book_key"] for x in rows}:
+                    run.log("missing", propline.SOURCE, scope, "NoBookData", f"{b} returned no player props for {','.join(markets)}")
+            ts_utc, ts_ct = iso_utc(now), iso_ct(now)
+            for x in rows:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO prop_snapshots(run_id, collected_at_utc, collected_at_ct, source, book_key, book_title, region, sport, "
+                    "game_id, odds_event_id, commence_time_utc, market, source_market_key, player_name, player_key, side, line, price_american, book_last_update_utc) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (run.id, ts_utc, ts_ct, propline.SOURCE, x["book_key"], x["book_title"], x["region"], sport,
+                     game["id"] if game else None, f"pl:{ev['id']}", iso_utc(start), x["market"], x["source_market_key"],
                      x["player_name"], x["player_key"], x["side"], x["line"], x["price_american"], x["book_last_update"]))
                 run.items += cur.rowcount
             conn.commit()

@@ -49,6 +49,13 @@ class Config:
     props_snapshots_per_event: int = field(default_factory=lambda: _int("SLATE_PROPS_SNAPSHOTS_PER_EVENT", 0))
     # Max estimated Odds API credits per Central-Time day (0 = no daily cap).
     odds_daily_credit_budget: int = field(default_factory=lambda: _int("SLATE_ODDS_DAILY_CREDIT_BUDGET", 0))
+    # PropLine (free 1,000 requests/day). Snapshots every game starting within the
+    # lookahead once per interval; stops when remaining daily requests hit the reserve.
+    propline_api_key: str = field(default_factory=lambda: os.environ.get("PROPLINE_API_KEY", "").strip())
+    propline_interval_min: int = field(default_factory=lambda: _int("SLATE_PROPLINE_INTERVAL_MIN", 60))
+    propline_lookahead_hours: int = field(default_factory=lambda: _int("SLATE_PROPLINE_LOOKAHEAD_HOURS", 12))
+    propline_request_reserve: int = field(default_factory=lambda: _int("SLATE_PROPLINE_REQUEST_RESERVE", 150))
+    propline_max_events_per_run: int = field(default_factory=lambda: _int("SLATE_PROPLINE_MAX_EVENTS_PER_RUN", 30))
     http_timeout: int = field(default_factory=lambda: _int("SLATE_HTTP_TIMEOUT", 15))
 
 

@@ -23,8 +23,9 @@ class HttpClient:
         self.min_interval = min_interval
         self._last = 0.0
 
-    def get_json(self, url, params=None):
-        """Return (data, headers). Raises HttpError or requests exceptions."""
+    def get_json(self, url, params=None, headers=None):
+        """Return (data, headers). Raises HttpError or requests exceptions.
+        Never log `headers`: they can carry API keys."""
         last_exc = None
         for attempt in range(2):
             wait = self.min_interval - (time.time() - self._last)
@@ -32,7 +33,7 @@ class HttpClient:
                 time.sleep(wait)
             self._last = time.time()
             try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc
                 time.sleep(2)
@@ -54,8 +55,9 @@ class FixtureClient:
         self.routes = routes
         self.calls = []
 
-    def get_json(self, url, params=None):
+    def get_json(self, url, params=None, headers=None):
         self.calls.append((url, dict(params or {})))
+        self.headers_seen = getattr(self, "headers_seen", []) + [dict(headers or {})]
         for needle, response in self.routes:
             if needle in url:
                 result = response(url, params) if callable(response) else response

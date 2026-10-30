@@ -4,7 +4,7 @@ Commands
   init-db                       create/upgrade the SQLite schema
   run-scheduled [--force JOB]   run whichever jobs are due (call from cron / Actions)
   loop [--tick SECONDS]         always-on mode: run-scheduled forever
-  collect-games | collect-injuries | collect-props | project | grade   run one job now
+  collect-games | collect-injuries | collect-props | collect-props-propline | project | grade   run one job now
   status                        collector health as JSON
   report [--out DIR]            write today's markdown report (Central date)
   export TABLE [--out FILE] [--since ISO]   CSV export of one table
@@ -60,9 +60,10 @@ def main(argv=None):
     elif cmd == "loop":
         conn.close()
         scheduler.loop(lambda: open_db(cfg.db_path), cfg, http, tick_seconds=a.tick)
-    elif cmd in ("collect-games", "collect-injuries", "collect-props", "project", "grade"):
+    elif cmd in ("collect-games", "collect-injuries", "collect-props", "collect-props-propline", "project", "grade"):
         fn = {"collect-games": collector.collect_games, "collect-injuries": collector.collect_injuries,
-              "collect-props": collector.collect_props, "project": collector.project, "grade": grading.grade}[cmd]
+              "collect-props": collector.collect_props, "collect-props-propline": collector.collect_props_propline,
+              "project": collector.project, "grade": grading.grade}[cmd]
         run = fn(conn, cfg, http)
         out({"job": run.job, "status": run.final_status, "items": run.items, "errors": run.errors, "missing": run.missing, "message": run.message})
         return 0 if run.final_status != "failed" else 1
