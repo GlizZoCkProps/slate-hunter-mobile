@@ -31,10 +31,15 @@ jobs:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
       SLATE_SPORTS: ${{ vars.SLATE_SPORTS || 'NBA,NFL,CFB' }}
       SLATE_BOOKS: ${{ vars.SLATE_BOOKS || 'draftkings,fanduel,prizepicks' }}
-      SLATE_PROPS_ACTIVE_INTERVAL_MIN: ${{ vars.SLATE_PROPS_ACTIVE_INTERVAL_MIN || '60' }}
-      SLATE_PROPS_IDLE_INTERVAL_MIN: ${{ vars.SLATE_PROPS_IDLE_INTERVAL_MIN || '360' }}
+      # Credit plan for the free Odds API tier (500/month): one near-close snapshot
+      # per game, taken 60-90 min before its own start, soonest games first across
+      # all sports, at most ~15 credits per Central-Time day (~465/month).
+      # Override any of these under Settings > Secrets and variables > Actions > Variables.
+      SLATE_PROPS_PREGAME_WINDOW_MIN: ${{ vars.SLATE_PROPS_PREGAME_WINDOW_MIN || '90' }}
+      SLATE_PROPS_SNAPSHOTS_PER_EVENT: ${{ vars.SLATE_PROPS_SNAPSHOTS_PER_EVENT || '1' }}
+      SLATE_ODDS_DAILY_CREDIT_BUDGET: ${{ vars.SLATE_ODDS_DAILY_CREDIT_BUDGET || '15' }}
+      SLATE_MAX_EVENTS_PER_RUN: ${{ vars.SLATE_MAX_EVENTS_PER_RUN || '5' }}
       SLATE_ODDS_CREDIT_RESERVE: ${{ vars.SLATE_ODDS_CREDIT_RESERVE || '25' }}
-      SLATE_MAX_EVENTS_PER_RUN: ${{ vars.SLATE_MAX_EVENTS_PER_RUN || '15' }}
     steps:
       - uses: actions/checkout@v4
 
