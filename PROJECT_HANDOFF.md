@@ -1,7 +1,7 @@
 # Slate Hunter — Project Handoff
 
 Shared source of truth for Claude (implementation) and ChatGPT (research and analytics review).
-Last updated: 2026-10-24, branch `feature/persistent-collector`.
+Last updated: 2026-10-29 (v0.6: pregame credit plan).
 
 ## 1. What Slate Hunter is
 
@@ -57,6 +57,7 @@ All timestamps are ISO-8601 UTC (`…Z`). Most tables also keep a Central Time c
 | `market_signals` | append | `line_move` / `price_move` between our own snapshots (`evidence_level='observed_line_change'`), and imported ticket/handle % (`reported_split`, source URL required) |
 | `injury_reports` | append on change | ESPN game-summary injury entries; a new row only when status or detail changes |
 | `projections` | append | `model_version`, projection, `est_prob_over` (NULL until a calibrated model exists), sample size, `inputs_json` for reproducibility |
+| `odds_calls` | append | One row per paid Odds API call: event, Central date, estimated and provider-reported credit cost, rows returned (schema v2) |
 | `player_ids` | upsert | Provider name → ESPN athlete id, with how it was resolved (or why it wasn't) |
 | `results` | upsert per (game, player, market) | Actual stat from the ESPN box score; DNP flagged |
 | `prop_grades` | upsert per (game, book, market, player, side) | Open/close snapshot, line and price, actual, outcome (`win`/`loss`/`push`/`void`/`ungraded` + reason). Covers **every tracked prop, bet or not** |
@@ -78,7 +79,15 @@ Grading rules:
 | PrizePicks / DraftKings / FanDuel sites | **Not scraped.** | — | Collected only through the licensed Odds API. No private accounts, no bypassing access controls. |
 | Betting splits (ticket/handle %) | Optional manual import (`import-splits`) | — | No free reliable feed is wired. Every row needs a source URL. A "sharp money" claim with no data is never stored as a signal. |
 
-Credit budgeting example: 10 NBA games with snapshots every 60 min over 6 active hours ≈ 10 × 3 × 6 = 180 credits for one day. **The free tier cannot snapshot every slate hourly.** Use `SLATE_SPORTS`, `SLATE_MAX_EVENTS_PER_RUN` and the intervals to ration credits, or upgrade the Odds API plan. The guard stops calls when remaining credits would drop below `SLATE_ODDS_CREDIT_RESERVE` and logs each skipped event.
+**Credit plan (v0.6, default in the GitHub workflow):** the free tier cannot snapshot every slate hourly (your first hourly-style run used 47 credits). The workflow therefore runs in *pregame mode*:
+
+- Every 30-minute run checks for games starting within `SLATE_PROPS_PREGAME_WINDOW_MIN` = 90 minutes.
+- Each game gets at most `SLATE_PROPS_SNAPSHOTS_PER_EVENT` = 1 paid snapshot, which lands about 60–90 min before its own start, so the closing line is close to the real close.
+- Games are taken **soonest first across all sports**, at most `SLATE_MAX_EVENTS_PER_RUN` = 5 per run.
+- Spending stops at `SLATE_ODDS_DAILY_CREDIT_BUDGET` = 15 estimated credits per Central-Time day (≈5 games/day, ≈465/month). The `SLATE_ODDS_CREDIT_RESERVE` guard still applies.
+- Every paid call is recorded in `odds_calls` (estimated cost, provider-reported cost, rows returned). Every game skipped for cap, budget or reserve is logged in `collection_errors` (`RunCapReached`, `DailyBudget`, `CreditReserve`).
+- Trade-off: with ~5 games/day, the rest of a big slate gets no lines. Raise the budget (paid plan) or add a free second source (PropLine, under evaluation) for full coverage.
+- Simulated over 48 scheduled runs: each game was snapshotted exactly once, ~85 min before start (`tests/test_pipeline.py::CreditControlTests`).
 
 ## 4. Setup
 
@@ -122,7 +131,7 @@ Run `python -m slatehunter loop` under `deploy/slate-hunter-collector.service`, 
 
 ### Config reference (env vars)
 
-`SLATE_DB_PATH` (default `data/slate_hunter.db`), `ODDS_API_KEY`, `SLATE_SPORTS` (NBA,NFL,CFB), `SLATE_BOOKS` (draftkings,fanduel,prizepicks), `SLATE_DAYS_AHEAD` (3), `SLATE_GAMES_INTERVAL_MIN` (180), `SLATE_PROPS_ACTIVE_INTERVAL_MIN` (60, used when a game starts within `SLATE_ACTIVE_WINDOW_HOURS`=6), `SLATE_PROPS_IDLE_INTERVAL_MIN` (360), `SLATE_PROPS_LOOKAHEAD_HOURS` (36), `SLATE_GRADE_INTERVAL_MIN` (60), `SLATE_ODDS_CREDIT_RESERVE` (25), `SLATE_MAX_EVENTS_PER_RUN` (15), `SLATE_HTTP_TIMEOUT` (15). Web only: `SLATE_DB_URL`, `SLATE_DB_REFRESH_SEC`.
+`SLATE_DB_PATH` (default `data/slate_hunter.db`), `ODDS_API_KEY`, `SLATE_SPORTS` (NBA,NFL,CFB), `SLATE_BOOKS` (draftkings,fanduel,prizepicks), `SLATE_DAYS_AHEAD` (3), `SLATE_GAMES_INTERVAL_MIN` (180), `SLATE_PROPS_ACTIVE_INTERVAL_MIN` (60, used when a game starts within `SLATE_ACTIVE_WINDOW_HOURS`=6), `SLATE_PROPS_IDLE_INTERVAL_MIN` (360), `SLATE_PROPS_LOOKAHEAD_HOURS` (36), `SLATE_GRADE_INTERVAL_MIN` (60), `SLATE_ODDS_CREDIT_RESERVE` (25), `SLATE_MAX_EVENTS_PER_RUN` (15; workflow 5), `SLATE_PROPS_PREGAME_WINDOW_MIN` (0 = off; workflow 90), `SLATE_PROPS_SNAPSHOTS_PER_EVENT` (0 = unlimited; workflow 1), `SLATE_ODDS_DAILY_CREDIT_BUDGET` (0 = none; workflow 15), `SLATE_HTTP_TIMEOUT` (15). When the pregame window is on, the props interval settings are ignored. Web only: `SLATE_DB_URL`, `SLATE_DB_REFRESH_SEC`.
 
 ### CLI
 
@@ -173,6 +182,7 @@ A pick is refused if its snapshot is over 3 h old, if the game has started, or i
 ## 6. Outstanding work (in priority order)
 
 1. Run the live verification above and fix any shape mismatches.
+   - Done 2026-10-24: first live run OK (98 games, 1,812 snapshots, 0 unmatched). Fixed 2026-10-29: run cap now fills soonest-first across sports (CFB had been starved); projection and error timestamps now use the job clock.
 2. Fix or remove the NFL/CFB `touchdowns` mapping in the interactive UI (`app.py` `ODDS_MARKETS`). It currently asks for passing TDs for every player.
 3. The interactive "evidence signals" tally counts overlapping samples (L5, L10, season) as separate signals. Show them as one historical signal.
 4. More markets (NBA threes/PRA are already parsed; football receptions; anytime TD as a yes/no market), each with grading tests.
