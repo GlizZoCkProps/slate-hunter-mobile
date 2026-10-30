@@ -201,6 +201,77 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(rejected), 2)
 
 
+class CreditControlTests(unittest.TestCase):
+    """Soonest-first across sports, pregame window, one snapshot per game, daily budget."""
+
+    CFB_EVENTS = [{"id": "cfbev1", "commence_time": "2026-10-24T23:00:00Z", "home_team": "Texas Longhorns", "away_team": "Georgia Bulldogs"}]
+
+    def http(self):
+        cfb_odds = {"id": "cfbev1", "bookmakers": [{"key": "draftkings", "title": "DraftKings", "markets": [
+            {"key": "player_pass_yds", "outcomes": [
+                {"name": "Over", "description": "Arch Manning", "price": -115, "point": 240.5},
+                {"name": "Under", "description": "Arch Manning", "price": -105, "point": 240.5}]}]}]}
+        quota = {"x-requests-remaining": "450", "x-requests-used": "50", "x-requests-last": "3"}
+        return FixtureClient([
+            ("/scoreboard", fx.NBA_SCOREBOARD),
+            ("/events/oddsev1/odds", (fx.odds_event(), quota)),
+            ("/events/oddsev_unmatched/odds", ({"bookmakers": []}, quota)),
+            ("/events/cfbev1/odds", (cfb_odds, quota)),
+            ("basketball_nba/events", (fx.ODDS_EVENTS_NBA, {})),
+            ("americanfootball_ncaaf/events", (self.CFB_EVENTS, {})),
+        ])
+
+    def setUp(self):
+        self.conn = open_db(":memory:")
+        collector.collect_games(self.conn, cfg_for(), self.http(), now=T0)
+
+    def paid_calls(self, http):
+        return [u for u, _ in http.calls if u.endswith("/odds")]
+
+    def test_soonest_first_across_sports(self):
+        cfg = cfg_for(sports=["NBA", "CFB"], max_events_per_run=1)
+        h = self.http()
+        run = collector.collect_props(self.conn, cfg, h, now=T0)
+        self.assertEqual(len(self.paid_calls(h)), 1)
+        self.assertIn("cfbev1", self.paid_calls(h)[0])   # 23:00Z CFB beats 02:30Z NBA even though NBA is listed first
+        capped = self.conn.execute("SELECT COUNT(*) FROM collection_errors WHERE run_id=? AND error_type='RunCapReached'", (run.id,)).fetchone()[0]
+        self.assertEqual(capped, 2)
+
+    def test_pregame_window(self):
+        cfg = cfg_for(props_pregame_window_min=90)
+        h = self.http()
+        collector.collect_props(self.conn, cfg, h, now=T0)          # tip is 9.5h away
+        self.assertEqual(self.paid_calls(h), [])
+        h = self.http()
+        collector.collect_props(self.conn, cfg, h, now=datetime(2026, 10, 25, 1, 15, tzinfo=timezone.utc))  # 75 min before tip
+        self.assertEqual(len(self.paid_calls(h)), 1)
+        self.assertIn("oddsev1", self.paid_calls(h)[0])
+        due, _ = scheduler.due_jobs(self.conn, cfg, now=datetime(2026, 10, 25, 1, 45, tzinfo=timezone.utc))
+        self.assertIn("collect_props", due)                        # checked every tick in pregame mode
+
+    def test_one_snapshot_per_game(self):
+        cfg = cfg_for(props_pregame_window_min=180, props_snapshots_per_event=1)
+        near = datetime(2026, 10, 25, 0, 30, tzinfo=timezone.utc)
+        h1, h2 = self.http(), self.http()
+        collector.collect_props(self.conn, cfg, h1, now=near)
+        collector.collect_props(self.conn, cfg, h2, now=near.replace(minute=59))
+        self.assertEqual(len(self.paid_calls(h1)), 2)   # both NBA games in window
+        self.assertEqual(self.paid_calls(h2), [])       # each already has its snapshot; no credits spent
+        row = self.conn.execute("SELECT COUNT(*), SUM(reported_cost) FROM odds_calls").fetchone()
+        self.assertEqual(tuple(row), (2, 6))
+
+    def test_daily_budget(self):
+        cfg = cfg_for(sports=["NBA", "CFB"], odds_daily_credit_budget=6)
+        h = self.http()
+        run = collector.collect_props(self.conn, cfg, h, now=T0)
+        self.assertEqual(len(self.paid_calls(h)), 2)    # 3 + 3 credits, third game would exceed 6
+        self.assertTrue(self.conn.execute("SELECT 1 FROM collection_errors WHERE run_id=? AND error_type='DailyBudget'", (run.id,)).fetchone())
+        h = self.http()
+        collector.collect_props(self.conn, cfg, h, now=T0.replace(hour=20))
+        self.assertEqual(self.paid_calls(h), [])        # same Central day: budget already spent
+        self.assertEqual(reports.health(self.conn, now=T0)["odds_credits_today_ct"]["credits"], 6)
+
+
 class EspnParsingTests(unittest.TestCase):
     def test_nba_box(self):
         players = espn.parse_box_players(fx.NBA_SUMMARY_FINAL)
