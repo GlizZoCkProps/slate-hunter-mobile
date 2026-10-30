@@ -11,7 +11,7 @@ Design rules:
 import os
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -198,6 +198,23 @@ CREATE TABLE IF NOT EXISTS prop_grades (
     graded_at_utc TEXT NOT NULL,
     UNIQUE (game_id, book_key, market, player_key, side)
 );
+
+-- One row per paid Odds API event-odds call (credit accounting; added in schema v2).
+CREATE TABLE IF NOT EXISTS odds_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES collection_runs(id),
+    called_at_utc TEXT NOT NULL,
+    called_date_ct TEXT NOT NULL,         -- YYYY-MM-DD in Central Time, for daily budgets
+    sport TEXT NOT NULL,
+    odds_event_id TEXT NOT NULL,
+    commence_time_utc TEXT,
+    estimated_cost INTEGER,
+    reported_cost INTEGER,                -- x-requests-last header when provided
+    rows_returned INTEGER,
+    ok INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_odds_calls_event ON odds_calls(odds_event_id);
+CREATE INDEX IF NOT EXISTS ix_odds_calls_day ON odds_calls(called_date_ct);
 
 -- Cache of provider player name -> ESPN athlete id resolutions.
 CREATE TABLE IF NOT EXISTS player_ids (

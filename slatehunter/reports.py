@@ -8,7 +8,7 @@ from .config import iso_ct, iso_utc, parse_iso, utc_now, CENTRAL
 from .util import player_key
 
 EXPORTABLE = ["games", "prop_snapshots", "projections", "market_signals", "injury_reports", "results",
-              "prop_grades", "paper_picks", "collection_runs", "collection_errors", "player_ids"]
+              "prop_grades", "paper_picks", "collection_runs", "collection_errors", "player_ids", "odds_calls"]
 
 
 def rows(conn, sql, params=()):
@@ -25,8 +25,12 @@ def health(conn, now=None):
     counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in EXPORTABLE}
     err24 = rows(conn, "SELECT kind, source, error_type, COUNT(*) n FROM collection_errors WHERE at_utc>=? GROUP BY 1,2,3 ORDER BY n DESC", (since,))
     q = conn.execute("SELECT quota_remaining, quota_used, started_at_utc FROM collection_runs WHERE quota_remaining IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+    day = now.astimezone(CENTRAL).date().isoformat()
+    spend = conn.execute("SELECT COUNT(*) calls, COALESCE(SUM(COALESCE(reported_cost, estimated_cost)),0) credits FROM odds_calls "
+                         "WHERE called_date_ct=? AND ok=1", (day,)).fetchone()
     return {"generated_at_utc": iso_utc(now), "generated_at_ct": iso_ct(now), "last_runs": last_runs, "table_counts": counts,
-            "errors_last_24h": err24, "odds_api_quota": dict(q) if q else None}
+            "errors_last_24h": err24, "odds_api_quota": dict(q) if q else None,
+            "odds_credits_today_ct": {"date": day, "calls": spend["calls"], "credits": spend["credits"]}}
 
 
 # ---------------------------------------------------------------- metrics
@@ -113,7 +117,7 @@ def export_csv(conn, table, out=None, since_utc=None):
     time_col = {"prop_snapshots": "collected_at_utc", "collection_runs": "started_at_utc", "collection_errors": "at_utc",
                 "projections": "created_at_utc", "market_signals": "observed_at_utc", "injury_reports": "collected_at_utc",
                 "results": "collected_at_utc", "prop_grades": "graded_at_utc", "paper_picks": "created_at_utc",
-                "games": "start_time_utc", "player_ids": "resolved_at_utc"}[table]
+                "games": "start_time_utc", "player_ids": "resolved_at_utc", "odds_calls": "called_at_utc"}[table]
     sql, params = f"SELECT * FROM {table}", ()
     if since_utc:
         sql, params = sql + f" WHERE {time_col} >= ?", (since_utc,)
@@ -137,7 +141,9 @@ def daily_report(conn, now=None):
     for r in h["last_runs"]:
         L.append(f"| {r['job']} | {r['started_at_utc']} | {r['status']} | {r['items_written']} | {r['error_count']} | {(r['message'] or '')[:80]} |")
     q = h["odds_api_quota"]
-    L += ["", f"Odds API credits remaining: {q['quota_remaining'] if q else 'unknown (no keyed call yet)'}", "",
+    t = h["odds_credits_today_ct"]
+    L += ["", f"Odds API credits remaining: {q['quota_remaining'] if q else 'unknown (no keyed call yet)'}; "
+              f"used today (CT {t['date']}): {t['credits']} over {t['calls']} calls", "",
           "Errors / missing data, last 24h:", ""]
     L += [f"- {e['kind']} · {e['source']} · {e['error_type']}: {e['n']}" for e in h["errors_last_24h"]] or ["- none"]
     L += ["", "## Table counts", ""] + [f"- {k}: {v}" for k, v in h["table_counts"].items()]

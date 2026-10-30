@@ -25,7 +25,7 @@ from .config import Config
 from .db import integrity_ok, open_db
 from .http import HttpClient
 
-APPEND_ONLY = ["prop_snapshots", "projections", "market_signals", "injury_reports", "collection_runs", "collection_errors", "results", "prop_grades", "paper_picks"]
+APPEND_ONLY = ["prop_snapshots", "odds_calls", "projections", "market_signals", "injury_reports", "collection_runs", "collection_errors", "results", "prop_grades", "paper_picks"]
 
 
 def main(argv=None):

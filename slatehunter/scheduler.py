@@ -24,7 +24,8 @@ def due_jobs(conn, cfg, now=None):
     active = market_is_active(conn, cfg, now)
     intervals = {
         "collect_games": cfg.games_interval_min,
-        "collect_props": cfg.props_active_interval_min if active else cfg.props_idle_interval_min,
+        # Pregame mode: check every tick; the window/per-game/daily limits control spend.
+        "collect_props": 1 if cfg.props_pregame_window_min > 0 else (cfg.props_active_interval_min if active else cfg.props_idle_interval_min),
         "collect_injuries": cfg.props_active_interval_min if active else cfg.props_idle_interval_min,
         "project": cfg.props_idle_interval_min,
         "grade": cfg.grade_interval_min,

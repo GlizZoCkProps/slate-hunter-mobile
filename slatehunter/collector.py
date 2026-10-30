@@ -59,7 +59,7 @@ class Run:
             self.missing += 1
         self.conn.execute(
             "INSERT INTO collection_errors(run_id, at_utc, kind, source, scope, error_type, message) VALUES (?,?,?,?,?,?,?)",
-            (self.id, iso_utc(), kind, source, scope, error_type, redact(message)[:500]))
+            (self.id, iso_utc(self.now), kind, source, scope, error_type, redact(message)[:500]))
 
     def error(self, source, scope, exc):
         self.log("error", source, scope, type(exc).__name__, str(exc))
@@ -204,7 +204,26 @@ def _last_quota(conn):
     return row["quota_remaining"] if row else None
 
 
+def _credits_today(conn, day_ct):
+    row = conn.execute("SELECT COALESCE(SUM(COALESCE(reported_cost, estimated_cost)),0) c FROM odds_calls WHERE called_date_ct=? AND ok=1",
+                       (day_ct,)).fetchone()
+    return row["c"]
+
+
+def _calls_for_event(conn, odds_event_id):
+    return conn.execute("SELECT COUNT(*) n FROM odds_calls WHERE odds_event_id=? AND ok=1", (odds_event_id,)).fetchone()["n"]
+
+
 def collect_props(conn, cfg, http, now=None):
+    """Snapshot player props for upcoming games, soonest game first across ALL sports.
+
+    Credit controls (each skip is logged in collection_errors as kind='missing'):
+      SLATE_PROPS_PREGAME_WINDOW_MIN   only games starting within N minutes (0 = use lookahead)
+      SLATE_PROPS_SNAPSHOTS_PER_EVENT  max paid calls per game (0 = unlimited)
+      SLATE_ODDS_DAILY_CREDIT_BUDGET   max estimated credits per Central day (0 = none)
+      SLATE_MAX_EVENTS_PER_RUN         max paid calls per run
+      SLATE_ODDS_CREDIT_RESERVE        never go below this many remaining credits
+    """
     now = now or utc_now()
     with Run(conn, "collect_props", now) as run:
         if not cfg.odds_api_key:
@@ -213,62 +232,87 @@ def collect_props(conn, cfg, http, now=None):
             return run
         remaining = _last_quota(conn)
         books = cfg.books
-        events_done = 0
+        day_ct = now.astimezone(CENTRAL).date().isoformat()
+        spent_today = _credits_today(conn, day_ct)
+        if cfg.props_pregame_window_min > 0:
+            horizon = now + timedelta(minutes=cfg.props_pregame_window_min)
+        else:
+            horizon = now + timedelta(hours=cfg.props_lookahead_hours)
+
+        # 1. Gather candidate events from every sport (the events endpoint costs 0 credits).
+        candidates = []
         for sport in cfg.sports:
             if sport not in odds_api.SPORT_KEYS:
                 continue
-            markets = odds_api.DEFAULT_MARKETS[sport]
-            provider = [odds_api.MARKETS[sport][m] for m in markets]
-            cost = odds_api.estimated_cost(len(provider), books)
             try:
-                evs, headers = odds_api.events(http, cfg.odds_api_key, sport,
-                                               commence_from=iso_utc(now),
-                                               commence_to=iso_utc(now + timedelta(hours=cfg.props_lookahead_hours)))
+                evs, _ = odds_api.events(http, cfg.odds_api_key, sport, commence_from=iso_utc(now), commence_to=iso_utc(horizon))
             except Exception as exc:
                 run.error(SOURCE_ODDS, f"{sport} events", exc)
                 continue
-            for ev in sorted(evs or [], key=lambda e: e.get("commence_time") or ""):
-                scope = f"{sport} {ev.get('away_team')} at {ev.get('home_team')} ({ev.get('id')})"
+            for ev in evs or []:
                 start = parse_iso(ev.get("commence_time"))
-                if not start or start <= now:
-                    continue  # pregame only; live lines are out of scope
-                if events_done >= cfg.max_events_per_run:
-                    run.log("missing", SOURCE_ODDS, scope, "RunCapReached", f"SLATE_MAX_EVENTS_PER_RUN={cfg.max_events_per_run} reached")
-                    continue
-                if remaining is not None and remaining - cost < cfg.odds_credit_reserve:
-                    run.log("missing", SOURCE_ODDS, scope, "CreditReserve",
-                            f"skipped: {remaining} credits left, call costs ~{cost}, reserve {cfg.odds_credit_reserve}")
-                    continue
-                game = match_game(conn, sport, ev.get("home_team"), ev.get("away_team"), ev.get("commence_time"))
-                if game is None:
-                    run.log("missing", SOURCE_ODDS, scope, "NoEspnMatch", "no ESPN game matched; snapshots stored with game_id NULL")
-                elif not game["odds_event_id"]:
-                    conn.execute("UPDATE games SET odds_event_id=? WHERE id=?", (ev.get("id"), game["id"]))
-                try:
-                    data, headers = odds_api.event_odds(http, cfg.odds_api_key, sport, ev["id"], provider, books)
-                except Exception as exc:
-                    run.error(SOURCE_ODDS, scope, exc)
-                    continue
-                events_done += 1
-                r, u = odds_api.quota(headers)
-                if r is not None:
-                    remaining, run.quota_remaining, run.quota_used = r, r, u
-                rows = odds_api.parse_event_odds(data, sport)
-                seen_books = {x["book_key"] for x in rows}
-                for b in books:
-                    if b not in seen_books:
-                        run.log("missing", SOURCE_ODDS, scope, "NoBookData", f"{b} returned no player props for {','.join(markets)}")
-                ts_utc, ts_ct = iso_utc(now), iso_ct(now)
-                for x in rows:
-                    cur = conn.execute(
-                        "INSERT OR IGNORE INTO prop_snapshots(run_id, collected_at_utc, collected_at_ct, source, book_key, book_title, region, sport, "
-                        "game_id, odds_event_id, commence_time_utc, market, source_market_key, player_name, player_key, side, line, price_american, book_last_update_utc) "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (run.id, ts_utc, ts_ct, SOURCE_ODDS, x["book_key"], x["book_title"], x["region"], sport,
-                         game["id"] if game else None, ev["id"], iso_utc(start), x["market"], x["source_market_key"],
-                         x["player_name"], x["player_key"], x["side"], x["line"], x["price_american"], x["book_last_update"]))
-                    run.items += cur.rowcount
-                conn.commit()
+                if start and now < start <= horizon:
+                    candidates.append((start, sport, ev))
+        candidates.sort(key=lambda c: (c[0], c[1]))
+
+        # 2. Spend credits on the soonest games first.
+        events_done = 0
+        for start, sport, ev in candidates:
+            scope = f"{sport} {ev.get('away_team')} at {ev.get('home_team')} ({ev.get('id')})"
+            markets = odds_api.DEFAULT_MARKETS[sport]
+            provider = [odds_api.MARKETS[sport][m] for m in markets]
+            cost = odds_api.estimated_cost(len(provider), books)
+            if cfg.props_snapshots_per_event and _calls_for_event(conn, ev["id"]) >= cfg.props_snapshots_per_event:
+                continue  # already has its snapshot(s); not a gap, so not logged
+            if events_done >= cfg.max_events_per_run:
+                run.log("missing", SOURCE_ODDS, scope, "RunCapReached", f"SLATE_MAX_EVENTS_PER_RUN={cfg.max_events_per_run} reached")
+                continue
+            if cfg.odds_daily_credit_budget and spent_today + cost > cfg.odds_daily_credit_budget:
+                run.log("missing", SOURCE_ODDS, scope, "DailyBudget",
+                        f"skipped: {spent_today} credits used today (CT {day_ct}), budget {cfg.odds_daily_credit_budget}, call ~{cost}")
+                continue
+            if remaining is not None and remaining - cost < cfg.odds_credit_reserve:
+                run.log("missing", SOURCE_ODDS, scope, "CreditReserve",
+                        f"skipped: {remaining} credits left, call costs ~{cost}, reserve {cfg.odds_credit_reserve}")
+                continue
+            game = match_game(conn, sport, ev.get("home_team"), ev.get("away_team"), ev.get("commence_time"))
+            if game is None:
+                run.log("missing", SOURCE_ODDS, scope, "NoEspnMatch", "no ESPN game matched; snapshots stored with game_id NULL")
+            elif not game["odds_event_id"]:
+                conn.execute("UPDATE games SET odds_event_id=? WHERE id=?", (ev.get("id"), game["id"]))
+            try:
+                data, headers = odds_api.event_odds(http, cfg.odds_api_key, sport, ev["id"], provider, books)
+            except Exception as exc:
+                run.error(SOURCE_ODDS, scope, exc)
+                conn.execute("INSERT INTO odds_calls(run_id, called_at_utc, called_date_ct, sport, odds_event_id, commence_time_utc, estimated_cost, ok) "
+                             "VALUES (?,?,?,?,?,?,?,0)", (run.id, iso_utc(now), day_ct, sport, ev["id"], iso_utc(start), cost))
+                continue
+            events_done += 1
+            r, u = odds_api.quota(headers)
+            if r is not None:
+                remaining, run.quota_remaining, run.quota_used = r, r, u
+            reported = odds_api.last_cost(headers)
+            spent_today += reported if reported is not None else cost
+            rows = odds_api.parse_event_odds(data, sport)
+            conn.execute("INSERT INTO odds_calls(run_id, called_at_utc, called_date_ct, sport, odds_event_id, commence_time_utc, estimated_cost, reported_cost, rows_returned, ok) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,1)", (run.id, iso_utc(now), day_ct, sport, ev["id"], iso_utc(start), cost, reported, len(rows)))
+            seen_books = {x["book_key"] for x in rows}
+            for b in books:
+                if b not in seen_books:
+                    run.log("missing", SOURCE_ODDS, scope, "NoBookData", f"{b} returned no player props for {','.join(markets)}")
+            ts_utc, ts_ct = iso_utc(now), iso_ct(now)
+            for x in rows:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO prop_snapshots(run_id, collected_at_utc, collected_at_ct, source, book_key, book_title, region, sport, "
+                    "game_id, odds_event_id, commence_time_utc, market, source_market_key, player_name, player_key, side, line, price_american, book_last_update_utc) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (run.id, ts_utc, ts_ct, SOURCE_ODDS, x["book_key"], x["book_title"], x["region"], sport,
+                     game["id"] if game else None, ev["id"], iso_utc(start), x["market"], x["source_market_key"],
+                     x["player_name"], x["player_key"], x["side"], x["line"], x["price_american"], x["book_last_update"]))
+                run.items += cur.rowcount
+            conn.commit()
+        if not candidates:
+            run.message = f"no games starting before {iso_utc(horizon)}"
         detect_moves(conn, run.id)
         conn.commit()
     return run
@@ -368,7 +412,7 @@ def project(conn, cfg, http, now=None, max_players=60, refresh_hours=12):
             pj.record_projection(conn, sport=t["sport"], game_id=t["game_id"], player_name=t["player_name"], pkey=t["player_key"],
                                  market=t["market"], projection=pj.baseline_v1(values), sample_size=len(values),
                                  inputs={"values_recent_first": values[:20], "metric_label": label, "gamelog": pj.gamelog_url(t["sport"], aid)},
-                                 athlete_id=aid, reference_line=snap["line"] if snap else None, reference_snapshot_id=t["snap_id"])
+                                 athlete_id=aid, reference_line=snap["line"] if snap else None, reference_snapshot_id=t["snap_id"], now=now)
             run.items += 1
         conn.commit()
     return run

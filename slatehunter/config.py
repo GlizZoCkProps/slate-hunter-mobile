@@ -42,6 +42,13 @@ class Config:
     # fall below this reserve. Free plan is 500 credits/month.
     odds_credit_reserve: int = field(default_factory=lambda: _int("SLATE_ODDS_CREDIT_RESERVE", 25))
     max_events_per_run: int = field(default_factory=lambda: _int("SLATE_MAX_EVENTS_PER_RUN", 15))
+    # Pregame mode: when > 0, only collect props for games starting within this many
+    # minutes, and the props job is due on every scheduler tick.
+    props_pregame_window_min: int = field(default_factory=lambda: _int("SLATE_PROPS_PREGAME_WINDOW_MIN", 0))
+    # Max paid snapshots per game (0 = unlimited). 1 = one near-close snapshot per game.
+    props_snapshots_per_event: int = field(default_factory=lambda: _int("SLATE_PROPS_SNAPSHOTS_PER_EVENT", 0))
+    # Max estimated Odds API credits per Central-Time day (0 = no daily cap).
+    odds_daily_credit_budget: int = field(default_factory=lambda: _int("SLATE_ODDS_DAILY_CREDIT_BUDGET", 0))
     http_timeout: int = field(default_factory=lambda: _int("SLATE_HTTP_TIMEOUT", 15))
 
 

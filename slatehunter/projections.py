@@ -69,12 +69,12 @@ def resolve_athlete(conn, http, sport, name, pkey, now_utc_iso):
 
 def record_projection(conn, *, sport, game_id, player_name, pkey, market, projection, sample_size,
                       inputs, athlete_id=None, reference_line=None, reference_snapshot_id=None,
-                      model_version=MODEL_VERSION, source="espn_gamelog", est_prob_over=None):
+                      model_version=MODEL_VERSION, source="espn_gamelog", est_prob_over=None, now=None):
     cur = conn.execute(
         "INSERT INTO projections(created_at_utc, created_at_ct, model_version, sport, game_id, espn_athlete_id, "
         "player_name, player_key, market, projection, est_prob_over, reference_line, reference_snapshot_id, "
         "sample_size, inputs_json, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (iso_utc(), iso_ct(), model_version, sport, game_id, athlete_id, player_name, pkey, market, projection,
+        (iso_utc(now), iso_ct(now), model_version, sport, game_id, athlete_id, player_name, pkey, market, projection,
          est_prob_over, reference_line, reference_snapshot_id, sample_size, json.dumps(inputs, default=str), source))
     return cur.lastrowid
 
