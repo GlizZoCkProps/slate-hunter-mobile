@@ -1,7 +1,7 @@
 # Slate Hunter — Project Handoff
 
 Shared source of truth for Claude (implementation) and ChatGPT (research and analytics review).
-Last updated: 2026-10-29 (v0.6: pregame credit plan).
+Last updated: 2026-10-29 (v0.6.1: pregame credit plan; projection input fix + shrink_v2).
 
 ## 1. What Slate Hunter is
 
@@ -183,8 +183,14 @@ A pick is refused if its snapshot is over 3 h old, if the game has started, or i
 
 1. Run the live verification above and fix any shape mismatches.
    - Done 2026-10-24: first live run OK (98 games, 1,812 snapshots, 0 unmatched). Fixed 2026-10-29: run cap now fills soonest-first across sports (CFB had been starved); projection and error timestamps now use the job clock.
-2. Fix or remove the NFL/CFB `touchdowns` mapping in the interactive UI (`app.py` `ODDS_MARKETS`). It currently asks for passing TDs for every player.
-3. The interactive "evidence signals" tally counts overlapping samples (L5, L10, season) as separate signals. Show them as one historical signal.
+2. **Projection models (v0.6.1).** `baseline_v1` (Oct 24 rows) read ESPN's whole game log, which mixes in **preseason** games and is not guaranteed newest-first. Live evidence: LeBron's "last 4" were 17/14/8/10 points. Fixed in `projections.clean_gamelog`. The collector now records two models per player/market:
+   - `baseline_v1_1`: same formula, regular season only, newest first.
+   - `shrink_v2` (primary, used for candidate ranking): shrinks toward last season's per-game mean, w = n/(n+8).
+   - Compare them with `reports.projection_error` (MAE/bias by model). `inputs_json` stores excluded preseason count, prior season, prior games and prior mean.
+   - **Verify after the first run** that `prior_season_games` looks like a full prior season (~50–80 NBA games, ~15–17 NFL), confirming ESPN's `season` parameter maps as assumed (NBA = ending year).
+   - The interactive web app (`/api/player-research`) still uses the old parsing; switch it to `clean_gamelog` after the collector version is verified.
+3. Fix or remove the NFL/CFB `touchdowns` mapping in the interactive UI (`app.py` `ODDS_MARKETS`). It currently asks for passing TDs for every player.
+4. The interactive "evidence signals" tally counts overlapping samples (L5, L10, season) as separate signals. Show them as one historical signal.
 4. More markets (NBA threes/PRA are already parsed; football receptions; anytime TD as a yes/no market), each with grading tests.
 5. A calibrated probability model (e.g. a distribution fit per player/market, validated out of sample) so `est_prob_over` can be filled and EV ranking replaces the descriptive gap. Until then, rankings are descriptive only.
 6. Closing-line capture: an optional short pregame snapshot interval (credit permitting).
