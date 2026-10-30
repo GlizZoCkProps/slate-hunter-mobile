@@ -361,8 +361,9 @@ def detect_moves(conn, run_id):
 # ---------------------------------------------------------------- projections
 
 def project(conn, cfg, http, now=None, max_players=60, refresh_hours=12):
-    """baseline_v1 projections for players with snapshots in upcoming games.
-    Uses ESPN game logs; one projection per (game, player, market) per refresh window."""
+    """baseline_v1_1 and shrink_v2 projections for players with snapshots in upcoming games.
+    Uses ESPN regular-season game logs (current + prior season); one projection per
+    (game, player, market, model) per refresh window."""
     from . import projections as pj
     now = now or utc_now()
     with Run(conn, "project", now) as run:
@@ -374,7 +375,7 @@ def project(conn, cfg, http, now=None, max_players=60, refresh_hours=12):
         cutoff = iso_utc(now - timedelta(hours=refresh_hours))
         todo = [t for t in todo if not conn.execute(
             "SELECT 1 FROM projections WHERE game_id=? AND player_key=? AND market=? AND model_version=? AND created_at_utc>?",
-            (t["game_id"], t["player_key"], t["market"], pj.MODEL_VERSION, cutoff)).fetchone()]
+            (t["game_id"], t["player_key"], t["market"], pj.PRIMARY_MODEL, cutoff)).fetchone()]
         if not todo:
             run.skip("nothing to project")
             return run
@@ -395,24 +396,46 @@ def project(conn, cfg, http, now=None, max_players=60, refresh_hours=12):
             if not aid:
                 run.log("missing", SOURCE_ESPN, scope, "NoAthleteId", note)
                 continue
-            if (t["sport"], aid) not in logs:
+            cur_season, prior_season = pj.season_for(t["sport"], now)
+            for key, season in (("cur", None), ("prior", prior_season)):
+                ck = (t["sport"], aid, key)
+                if ck in logs:
+                    continue
                 try:
-                    logs[(t["sport"], aid)] = http.get_json(pj.gamelog_url(t["sport"], aid))[0]
+                    logs[ck] = http.get_json(pj.gamelog_url(t["sport"], aid), pj.gamelog_params(season))[0]
                 except Exception as exc:
-                    logs[(t["sport"], aid)] = None
-                    run.error(SOURCE_ESPN, scope, exc)
-            data = logs[(t["sport"], aid)]
+                    logs[ck] = None
+                    if key == "cur":
+                        run.error(SOURCE_ESPN, scope, exc)
+                    else:
+                        run.log("missing", SOURCE_ESPN, scope, "NoPriorSeason", f"season {season} game log unavailable: {type(exc).__name__}")
+            data = logs[(t["sport"], aid, "cur")]
             if data is None:
                 continue
             values, label = pj.gamelog_values(data, t["sport"], t["market"])
-            if not values:
+            _, _, excluded = pj.clean_gamelog(data)
+            prior_values = []
+            if logs[(t["sport"], aid, "prior")] is not None:
+                prior_values, _ = pj.gamelog_values(logs[(t["sport"], aid, "prior")], t["sport"], t["market"])
+            prior_mean = round(sum(prior_values) / len(prior_values), 3) if prior_values else None
+            if not values and prior_mean is None:
                 run.log("missing", SOURCE_ESPN, scope, "NoGamelogValues", f"no numeric values parsed ({label})")
                 continue
             snap = conn.execute("SELECT line FROM prop_snapshots WHERE id=?", (t["snap_id"],)).fetchone()
-            pj.record_projection(conn, sport=t["sport"], game_id=t["game_id"], player_name=t["player_name"], pkey=t["player_key"],
-                                 market=t["market"], projection=pj.baseline_v1(values), sample_size=len(values),
-                                 inputs={"values_recent_first": values[:20], "metric_label": label, "gamelog": pj.gamelog_url(t["sport"], aid)},
-                                 athlete_id=aid, reference_line=snap["line"] if snap else None, reference_snapshot_id=t["snap_id"], now=now)
+            inputs = {"values_recent_first": values[:20], "metric_label": label, "preseason_games_excluded": excluded,
+                      "prior_season": prior_season, "prior_season_games": len(prior_values), "prior_season_mean": prior_mean,
+                      "shrink_k": pj.SHRINK_K, "gamelog": pj.gamelog_url(t["sport"], aid)}
+            common = dict(sport=t["sport"], game_id=t["game_id"], player_name=t["player_name"], pkey=t["player_key"],
+                          market=t["market"], inputs=inputs, athlete_id=aid,
+                          reference_line=snap["line"] if snap else None, reference_snapshot_id=t["snap_id"], now=now)
+            if values:
+                pj.record_projection(conn, projection=pj.baseline_v1_1(values), sample_size=len(values),
+                                     model_version="baseline_v1_1", **common)
+                run.items += 1
+            if prior_mean is None:
+                run.log("missing", SOURCE_ESPN, scope, "NoPriorSeason", "no prior-season values; shrink_v2 equals baseline_v1_1")
+            pj.record_projection(conn, projection=pj.shrink_v2(values, prior_mean), sample_size=len(values),
+                                 model_version=pj.PRIMARY_MODEL, **common)
             run.items += 1
         conn.commit()
     return run

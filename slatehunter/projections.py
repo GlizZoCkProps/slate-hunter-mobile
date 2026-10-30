@@ -1,9 +1,13 @@
 """Projection models. Each model has a version string stored with every row.
 
-baseline_v1 is the same heuristic the web app has always shown:
-    0.65 * mean(last 5 games) + 0.35 * mean(all games in ESPN's current game log)
-It is descriptive, NOT calibrated: est_prob_over is left NULL. Do not present
-its output as a probability.
+baseline_v1   (Oct 24 rows only) 0.65*mean(last 5) + 0.35*mean(all) over ESPN's whole
+              game log. Bug: the log mixes in PRESEASON games and is not guaranteed
+              newest-first. Kept only so old rows stay reproducible.
+baseline_v1_1 same formula, regular-season/postseason games only, sorted newest first.
+shrink_v2     baseline_v1_1 shrunk toward last season's per-game mean while the current
+              sample is small:  w = n / (n + K),  proj = w*current + (1-w)*last_season.
+              Falls back to baseline_v1_1 when no prior-season log is available.
+None of these is calibrated: est_prob_over stays NULL. Do not present them as probabilities.
 """
 import json
 import statistics
@@ -13,7 +17,9 @@ from .espn_players import choose_metric, flatten_stat_labels, get_search_items
 from .sources import espn
 from .util import player_key
 
-MODEL_VERSION = "baseline_v1"
+MODEL_VERSION = "baseline_v1_1"
+PRIMARY_MODEL = "shrink_v2"      # used for candidate ranking
+SHRINK_K = 8                     # games of weight given to last season
 SEARCH_URL = "https://site.web.api.espn.com/apis/search/v2"
 GAMELOG_URL = "https://site.web.api.espn.com/apis/common/v3/sports/{path}/athletes/{aid}/gamelog"
 SEARCH_SPORT = {"NBA": "basketball", "NFL": "football", "CFB": "football"}
@@ -28,8 +34,73 @@ def baseline_v1(values):
     return round(statistics.mean(recent) * 0.65 + statistics.mean(values) * 0.35, 2)
 
 
-def gamelog_values(data, sport, market):
+def _excluded_season_type(st):
+    name = " ".join(str(st.get(k) or "") for k in ("displayName", "name", "abbreviation")).lower()
+    return "preseason" in name or "pre season" in name or "all-star" in name or "all star" in name
+
+
+def clean_gamelog(data):
+    """Drop preseason/All-Star season types and sort game rows newest first.
+
+    Returns (labels, rows, excluded_count). Rows without a parseable date keep
+    their relative order after dated rows.
+    """
+    if not isinstance(data, dict):
+        return [], [], 0
+    seasons = data.get("seasonTypes")
+    excluded = 0
+    if isinstance(seasons, list):
+        kept = []
+        for st in seasons:
+            if isinstance(st, dict) and _excluded_season_type(st):
+                for cat in st.get("categories") or []:
+                    excluded += len((cat or {}).get("events") or [])
+                continue
+            kept.append(st)
+        data = {**data, "seasonTypes": kept}
     labels, rows = flatten_stat_labels(data)
+    meta = data.get("events") if isinstance(data.get("events"), dict) else {}
+
+    def when(row):
+        raw = row.get("raw") or {}
+        m = meta.get(str(raw.get("eventId") or raw.get("id") or ""), {}) if isinstance(meta, dict) else {}
+        return str(m.get("gameDate") or m.get("date") or "")
+
+    dated = [r for r in rows if when(r)]
+    undated = [r for r in rows if not when(r)]
+    dated.sort(key=when, reverse=True)
+    return labels, dated + undated, excluded
+
+
+def baseline_v1_1(values):
+    return baseline_v1(values)
+
+
+def shrink_v2(values, prior_mean, k=SHRINK_K):
+    cur = baseline_v1(values)
+    if prior_mean is None:
+        return cur
+    if cur is None:
+        return round(prior_mean, 2)
+    w = len(values) / (len(values) + k)
+    return round(w * cur + (1 - w) * prior_mean, 2)
+
+
+def season_for(sport, when):
+    """ESPN season year of the season in progress on `when`, and the prior one."""
+    if sport == "NBA":
+        cur = when.year + 1 if when.month >= 8 else when.year
+    else:
+        cur = when.year if when.month >= 3 else when.year - 1
+    return cur, cur - 1
+
+
+def gamelog_values(data, sport, market, legacy=False):
+    """Most-recent-first values. legacy=True reproduces baseline_v1's raw parsing."""
+    if legacy:
+        labels, rows = flatten_stat_labels(data)
+    else:
+        labels, rows, _ = clean_gamelog(data)
     if market in COMPONENTS:
         series = [choose_metric(sport, m, labels, rows)[0] for m in COMPONENTS[market]]
         n = min(len(s) for s in series) if series else 0
@@ -81,3 +152,7 @@ def record_projection(conn, *, sport, game_id, player_name, pkey, market, projec
 
 def gamelog_url(sport, aid):
     return GAMELOG_URL.format(path=espn.PATHS[sport], aid=aid)
+
+
+def gamelog_params(season=None):
+    return {"season": str(season)} if season else None

@@ -97,7 +97,9 @@ def candidates(conn, now=None, limit=50):
                   AND u.player_key=l.player_key AND u.side='under' AND u.line IS l.line) under_price,
                p.projection, p.model_version, p.sample_size, p.id projection_id
         FROM latest l JOIN games g ON g.id=l.game_id
-        LEFT JOIN projections p ON p.id = (SELECT MAX(id) FROM projections p3 WHERE p3.game_id=l.game_id AND p3.player_key=l.player_key AND p3.market=l.market)
+        LEFT JOIN projections p ON p.id = COALESCE(
+          (SELECT MAX(id) FROM projections p3 WHERE p3.game_id=l.game_id AND p3.player_key=l.player_key AND p3.market=l.market AND p3.model_version='shrink_v2'),
+          (SELECT MAX(id) FROM projections p3 WHERE p3.game_id=l.game_id AND p3.player_key=l.player_key AND p3.market=l.market))
         WHERE g.start_time_utc > ? AND g.completed=0""", (iso_utc(now),))
     for d in data:
         d["gap"] = round(d["projection"] - d["line"], 2) if d["projection"] is not None and d["line"] is not None else None
@@ -158,7 +160,7 @@ def daily_report(conn, now=None):
     for p in paper_summary(conn):
         L.append(f"- {p['model_version']}: {p['picks']} picks ({p['open']} open), {p['wins']}-{p['losses']}-{p['pushes']}, "
                  f"profit {p['profit_units']}u, ROI {p['roi']}, avg CLV line {p['avg_clv_line']}, avg CLV prob {p['avg_clv_prob']}")
-    L += ["", "## Upcoming candidates (gap = baseline projection − line; descriptive, not a probability)", "",
+    L += ["", "## Upcoming candidates (gap = shrink_v2 projection − line; descriptive, not a probability)", "",
           "| game (CT) | book | player | market | line | over/under | proj | gap | injury | snapshot |", "|---|---|---|---|---|---|---|---|---|---|"]
     for c in candidates(conn, now, limit=25):
         L.append(f"| {c['game']} {c['start_time_ct'][:16] if c['start_time_ct'] else ''} | {c['book_key']} | {c['player_name']} | {c['market']} | "
