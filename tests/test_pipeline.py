@@ -110,8 +110,9 @@ class PipelineTests(unittest.TestCase):
 
         # 5. projections
         run = collector.project(c, self.cfg, client(fx.odds_event()), now=T1)
-        p = c.execute("SELECT * FROM projections WHERE player_key='lebronjames' AND market='points'").fetchone()
-        self.assertEqual(p["model_version"], "baseline_v1")
+        p = c.execute("SELECT * FROM projections WHERE player_key='lebronjames' AND market='points' AND model_version='baseline_v1_1'").fetchone()
+        v2 = c.execute("SELECT * FROM projections WHERE player_key='lebronjames' AND market='points' AND model_version='shrink_v2'").fetchone()
+        self.assertAlmostEqual(v2["projection"], 24.0)   # fixture prior season mean is also 24
         self.assertAlmostEqual(p["projection"], 24.0)    # mean(26,22)=24 both terms
         self.assertIsNone(p["est_prob_over"])            # no calibrated probability claimed
         self.assertEqual(p["espn_athlete_id"], "1966")
@@ -145,8 +146,9 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("Collector health", text)
         buf = reports.export_csv(c, "prop_snapshots")
         self.assertEqual(len(buf.getvalue().strip().splitlines()), 1 + 24)
-        err = reports.projection_error(c)
-        self.assertEqual(err[0]["mae"], 3.0)           # |27 - 24|
+        err = {(e["model_version"], e["market"]): e for e in reports.projection_error(c)}
+        self.assertEqual(err[("baseline_v1_1", "points")]["mae"], 3.0)   # |27 - 24|
+        self.assertEqual(err[("shrink_v2", "points")]["mae"], 3.0)
 
     def test_failures_are_recorded(self):
         c = self.conn
@@ -270,6 +272,43 @@ class CreditControlTests(unittest.TestCase):
         collector.collect_props(self.conn, cfg, h, now=T0.replace(hour=20))
         self.assertEqual(self.paid_calls(h), [])        # same Central day: budget already spent
         self.assertEqual(reports.health(self.conn, now=T0)["odds_credits_today_ct"]["credits"], 6)
+
+
+class ProjectionModelTests(unittest.TestCase):
+    LOG = {
+        "labels": ["PTS"],
+        "events": {"r1": {"gameDate": "2026-10-22T23:00Z"}, "r2": {"gameDate": "2026-10-26T23:00Z"},
+                   "p1": {"gameDate": "2026-10-10T23:00Z"}, "p2": {"gameDate": "2026-10-12T23:00Z"}},
+        "seasonTypes": [
+            {"displayName": "2026-27 Regular Season", "categories": [{"events": [
+                {"eventId": "r1", "stats": ["20"]}, {"eventId": "r2", "stats": ["30"]}]}]},   # oldest first on purpose
+            {"displayName": "2026-27 Preseason", "categories": [{"events": [
+                {"eventId": "p1", "stats": ["6"]}, {"eventId": "p2", "stats": ["8"]}]}]},
+        ],
+    }
+
+    def test_preseason_excluded_and_sorted(self):
+        from slatehunter import projections as pj
+        values, _ = pj.gamelog_values(self.LOG, "NBA", "points")
+        self.assertEqual(values, [30.0, 20.0])                 # newest first, no preseason
+        legacy, _ = pj.gamelog_values(self.LOG, "NBA", "points", legacy=True)
+        self.assertEqual(sorted(legacy), [6.0, 8.0, 20.0, 30.0])  # what baseline_v1 used to see
+        self.assertEqual(pj.clean_gamelog(self.LOG)[2], 2)
+
+    def test_shrink_v2(self):
+        from slatehunter import projections as pj
+        # current baseline 25 (n=2), prior 30, K=8 -> 0.2*25 + 0.8*30 = 29
+        self.assertEqual(pj.shrink_v2([30.0, 20.0], 30.0), 29.0)
+        self.assertEqual(pj.shrink_v2([30.0, 20.0], None), 25.0)
+        self.assertEqual(pj.shrink_v2([], 30.0), 30.0)
+        # weight on current grows with sample: n=24 -> 0.75 current
+        self.assertAlmostEqual(pj.shrink_v2([20.0] * 24, 40.0), 25.0)
+
+    def test_season_for(self):
+        from slatehunter import projections as pj
+        self.assertEqual(pj.season_for("NBA", T0), (2027, 2026))
+        self.assertEqual(pj.season_for("NFL", T0), (2026, 2025))
+        self.assertEqual(pj.season_for("NFL", datetime(2027, 1, 10, tzinfo=timezone.utc)), (2026, 2025))
 
 
 class EspnParsingTests(unittest.TestCase):
