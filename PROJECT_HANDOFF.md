@@ -1,7 +1,7 @@
 # Slate Hunter — Project Handoff
 
 Shared source of truth for Claude (implementation) and ChatGPT (research and analytics review).
-Last updated: 2026-10-29 (v0.6.1: pregame credit plan; projection input fix + shrink_v2).
+Last updated: 2026-10-29 (v0.7: PropLine second source; pregame credit plan; projection input fix + shrink_v2).
 
 ## 1. What Slate Hunter is
 
@@ -76,6 +76,7 @@ Grading rules:
 |---|---|---|---|
 | ESPN site API (`site.api.espn.com`, `site.web.api.espn.com`) | Schedules, scores, box scores, injuries, player search, game logs | Free, no key. **Unofficial and undocumented**; can change shape or rate-limit at any time. The client spaces requests ≥0.35 s and retries once. | Personal, low-volume research only. Subject to ESPN's terms of use. Do not redistribute bulk data. |
 | The Odds API (`api.the-odds-api.com`, v4) | DraftKings, FanDuel (`us` region) and PrizePicks (`us_dfs` region) player props | Free Starter plan: 500 credits/month (verify on the-odds-api.com). `/events` is free. Event odds cost ≈ markets × regions, and with the `bookmakers` parameter each group of ≤10 books counts as 1 region. Defaults: 3 markets × 1 = **~3 credits per game per snapshot**. | Licensed API; key required (`ODDS_API_KEY`). Respect their ToS; don't share the key. |
+| PropLine (`api.prop-line.com/v1`) | Second prop source (DK, FD, PrizePicks): job `collect_props_propline` | Free: 1,000 requests/day, no card. Auth header `X-API-Key`; quota headers `X-Daily-Remaining`/`X-Daily-Used`. Defaults: hourly snapshots of every game starting within 12 h, ≤30 games per run, stop at 150 remaining requests. Typical day ≈ 24 × (3 + ~10) ≈ 300 requests. | Newer, smaller provider; API details taken from its official SDK (propline@0.52.0), not yet confirmed by a live call. PrizePicks/Underdog prices are synthetic (+100), so they are stored as NULL; goblin/demon alternates are skipped. Rows have `source='propline'` and `odds_event_id='pl:<id>'`. |
 | PrizePicks / DraftKings / FanDuel sites | **Not scraped.** | — | Collected only through the licensed Odds API. No private accounts, no bypassing access controls. |
 | Betting splits (ticket/handle %) | Optional manual import (`import-splits`) | — | No free reliable feed is wired. Every row needs a source URL. A "sharp money" claim with no data is never stored as a signal. |
 
@@ -181,7 +182,11 @@ A pick is refused if its snapshot is over 3 h old, if the game has started, or i
 
 ## 6. Outstanding work (in priority order)
 
-1. Run the live verification above and fix any shape mismatches.
+1. **PropLine live verification (v0.7).** After the first keyed run, check:
+   - `collection_runs` row `collect_props_propline` is `ok` with `quota_remaining` set.
+   - `collection_errors` `NoBookData` rows show which books/sports PropLine lacks (especially NFL/CFB DK/FD).
+   - The daily report's "Source agreement" table: same-line % between the Odds API and PropLine for the same book/player/side within 30 min. Decide on making PropLine primary only after several days with high agreement.
+   - Then run the live verification above and fix any shape mismatches.
    - Done 2026-10-24: first live run OK (98 games, 1,812 snapshots, 0 unmatched). Fixed 2026-10-29: run cap now fills soonest-first across sports (CFB had been starved); projection and error timestamps now use the job clock.
 2. **Projection models (v0.6.1).** `baseline_v1` (Oct 24 rows) read ESPN's whole game log, which mixes in **preseason** games and is not guaranteed newest-first. Live evidence: LeBron's "last 4" were 17/14/8/10 points. Fixed in `projections.clean_gamelog`. The collector now records two models per player/market:
    - `baseline_v1_1`: same formula, regular season only, newest first.
