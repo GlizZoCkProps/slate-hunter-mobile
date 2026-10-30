@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Optional space-separated jobs to force (collect_games collect_injuries collect_props project grade)"
+        description: "Optional space-separated jobs to force (collect_games collect_injuries collect_props collect_props_propline project grade)"
         required: false
         default: ""
 
@@ -29,6 +29,7 @@ jobs:
     env:
       SLATE_DB_PATH: datadir/slate_hunter.db
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      PROPLINE_API_KEY: ${{ secrets.PROPLINE_API_KEY }}
       SLATE_SPORTS: ${{ vars.SLATE_SPORTS || 'NBA,NFL,CFB' }}
       SLATE_BOOKS: ${{ vars.SLATE_BOOKS || 'draftkings,fanduel,prizepicks' }}
       # Credit plan for the free Odds API tier (500/month): one near-close snapshot
@@ -40,6 +41,10 @@ jobs:
       SLATE_ODDS_DAILY_CREDIT_BUDGET: ${{ vars.SLATE_ODDS_DAILY_CREDIT_BUDGET || '15' }}
       SLATE_MAX_EVENTS_PER_RUN: ${{ vars.SLATE_MAX_EVENTS_PER_RUN || '5' }}
       SLATE_ODDS_CREDIT_RESERVE: ${{ vars.SLATE_ODDS_CREDIT_RESERVE || '25' }}
+      # PropLine (free 1,000 requests/day): hourly snapshots of every game in the next 12h.
+      SLATE_PROPLINE_INTERVAL_MIN: ${{ vars.SLATE_PROPLINE_INTERVAL_MIN || '60' }}
+      SLATE_PROPLINE_LOOKAHEAD_HOURS: ${{ vars.SLATE_PROPLINE_LOOKAHEAD_HOURS || '12' }}
+      SLATE_PROPLINE_REQUEST_RESERVE: ${{ vars.SLATE_PROPLINE_REQUEST_RESERVE || '150' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +77,7 @@ jobs:
         run: |
           ARGS=""
           for j in $FORCE_JOBS; do
-            case "$j" in collect_games|collect_injuries|collect_props|project|grade) ARGS="$ARGS --force $j";; *) echo "::warning::ignoring unknown job $j";; esac
+            case "$j" in collect_games|collect_injuries|collect_props|collect_props_propline|project|grade) ARGS="$ARGS --force $j";; *) echo "::warning::ignoring unknown job $j";; esac
           done
           python -m slatehunter run-scheduled $ARGS
 
