@@ -48,6 +48,13 @@ def quota(headers):
     return as_int(headers.get("x-requests-remaining")), as_int(headers.get("x-requests-used"))
 
 
+def last_cost(headers):
+    try:
+        return int(float(headers.get("x-requests-last")))
+    except (TypeError, ValueError):
+        return None
+
+
 def events(http, api_key, sport, commence_from=None, commence_to=None):
     params = {"apiKey": api_key, "dateFormat": "iso"}
     if commence_from:
