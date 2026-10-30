@@ -274,6 +274,82 @@ class CreditControlTests(unittest.TestCase):
         self.assertEqual(reports.health(self.conn, now=T0)["odds_credits_today_ct"]["credits"], 6)
 
 
+class PropLineTests(unittest.TestCase):
+    EVENTS = [
+        {"id": 9001, "sport_key": "basketball_nba", "commence_time": "2026-10-25T02:30:00Z",
+         "home_team": "Los Angeles Lakers", "away_team": "Golden State Warriors"},
+        {"id": 9002, "sport_key": "basketball_nba", "commence_time": "2026-10-28T02:30:00Z",   # beyond 12h lookahead
+         "home_team": "Los Angeles Lakers", "away_team": "Boston Celtics"},
+    ]
+    ODDS = {"id": 9001, "bookmakers": [
+        {"key": "draftkings", "title": "DraftKings", "markets": [{"key": "player_points", "outcomes": [
+            {"name": "Over", "description": "LeBron James", "price": -112, "point": 25.5, "last_change_at": "2026-10-24T20:00:00Z"},
+            {"name": "Under", "description": "LeBron James", "price": -108, "point": 25.5}]}]},
+        {"key": "prizepicks", "title": "PrizePicks", "markets": [{"key": "player_points", "outcomes": [
+            {"name": "Over", "description": "LeBron James", "price": 100, "point": 25.0, "dfs_odds_type": "standard"},
+            {"name": "Under", "description": "LeBron James", "price": 100, "point": 25.0, "dfs_odds_type": "standard"},
+            {"name": "Over", "description": "LeBron James", "price": 100, "point": 21.5, "dfs_odds_type": "goblin"}]}]},
+        {"key": "fanduel", "title": "FanDuel", "markets": [{"key": "player_rebounds", "suspended_at": "2026-10-24T20:00:00Z", "outcomes": [
+            {"name": "Over", "description": "LeBron James", "price": -110, "point": 7.5}]}]},
+    ]}
+
+    def http(self, remaining="900"):
+        q = {"x-daily-remaining": remaining, "x-daily-used": "100", "x-daily-limit": "1000"}
+        return FixtureClient([
+            ("/scoreboard", fx.NBA_SCOREBOARD),
+            ("api.prop-line.com/v1/sports/basketball_nba/events/9001/odds", (self.ODDS, q)),
+            ("api.prop-line.com/v1/sports/basketball_nba/events", (self.EVENTS, q)),
+        ])
+
+    def setUp(self):
+        self.conn = open_db(":memory:")
+        collector.collect_games(self.conn, cfg_for(), self.http(), now=T0)
+        self.cfg = cfg_for(propline_api_key="pl-test-key")
+
+    def test_collects_with_header_auth_and_honest_prices(self):
+        h = self.http()
+        run = collector.collect_props_propline(self.conn, self.cfg, h, now=T0)
+        self.assertEqual(run.final_status, "ok")
+        self.assertTrue(all(x.get("X-API-Key") == "pl-test-key" for x in h.headers_seen))
+        self.assertFalse(any("pl-test-key" in str(p) for _, p in h.calls))         # key never in the URL
+        self.assertEqual([u for u, _ in h.calls if u.endswith("/odds")], ["https://api.prop-line.com/v1/sports/basketball_nba/events/9001/odds"])
+        rows = self.conn.execute("SELECT * FROM prop_snapshots WHERE source='propline' ORDER BY id").fetchall()
+        self.assertEqual(len(rows), 4)                                             # DK over/under + PP standard over/under
+        pp = [r for r in rows if r["book_key"] == "prizepicks"]
+        self.assertTrue(all(r["price_american"] is None for r in pp))              # synthetic +100 not stored as a price
+        self.assertEqual({r["line"] for r in pp}, {25.0})                          # goblin 21.5 skipped
+        self.assertTrue(all(r["odds_event_id"] == "pl:9001" and r["game_id"] for r in rows))
+        self.assertEqual(run.quota_remaining, 900)
+        self.assertTrue(self.conn.execute("SELECT 1 FROM collection_errors WHERE run_id=? AND error_type='NoBookData' AND message LIKE 'fanduel%'", (run.id,)).fetchone())
+
+    def test_request_reserve(self):
+        run = collector.collect_props_propline(self.conn, cfg_for(propline_api_key="k", propline_request_reserve=150), self.http("120"), now=T0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prop_snapshots").fetchone()[0], 0)
+        self.assertTrue(self.conn.execute("SELECT 1 FROM collection_errors WHERE run_id=? AND error_type='RequestReserve'", (run.id,)).fetchone())
+
+    def test_no_key_skips_and_scheduler_includes_job(self):
+        run = collector.collect_props_propline(self.conn, cfg_for(), self.http(), now=T0)
+        self.assertEqual(run.final_status, "skipped")
+        due, _ = scheduler.due_jobs(open_db(":memory:"), self.cfg, now=T0)
+        self.assertIn("collect_props_propline", due)
+
+    def test_source_comparison(self):
+        collector.collect_props(self.conn, cfg_for(), client(fx.odds_event(25.5, -112, -108)), now=T0)   # Odds API
+        collector.collect_props_propline(self.conn, self.cfg, self.http(), now=T0.replace(minute=20))      # PropLine 20 min later
+        comp = {r["book_key"]: r for r in reports.source_comparison(self.conn)}
+        self.assertEqual(comp["draftkings"]["pairs"], 2)
+        self.assertEqual(comp["draftkings"]["same_line_pct"], 1.0)
+        self.assertEqual(comp["draftkings"]["same_price_pct"], 1.0)
+        self.assertEqual(comp["prizepicks"]["same_line_pct"], 1.0)
+        self.assertIn("Source agreement", reports.daily_report(self.conn, now=T0.replace(minute=30))[1])
+
+    def test_sources_grade_together(self):
+        collector.collect_props_propline(self.conn, self.cfg, self.http(), now=T1)
+        grading.grade(self.conn, self.cfg, FixtureClient([("/summary", fx.NBA_SUMMARY_FINAL)]), now=T_AFTER)
+        g = self.conn.execute("SELECT * FROM prop_grades WHERE book_key='draftkings' AND side='over'").fetchone()
+        self.assertEqual((g["close_line"], g["actual_value"], g["outcome"]), (25.5, 27.0, "win"))
+
+
 class ProjectionModelTests(unittest.TestCase):
     LOG = {
         "labels": ["PTS"],
