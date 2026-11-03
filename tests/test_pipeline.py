@@ -322,6 +322,29 @@ class PropLineTests(unittest.TestCase):
         self.assertEqual(run.quota_remaining, 900)
         self.assertTrue(self.conn.execute("SELECT 1 FROM collection_errors WHERE run_id=? AND error_type='NoBookData' AND message LIKE 'fanduel%'", (run.id,)).fetchone())
 
+    def test_change_only_storage(self):
+        import copy
+        collector.collect_props_propline(self.conn, self.cfg, self.http(), now=T0)
+        r2 = collector.collect_props_propline(self.conn, self.cfg, self.http(), now=T0.replace(hour=18))
+        self.assertEqual(r2.items, 0)                       # identical lines: nothing duplicated
+        self.assertEqual(r2.unchanged, 4)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prop_seen WHERE run_id=?", (r2.id,)).fetchone()[0], 4)
+        moved = copy.deepcopy(self.ODDS)
+        for oc in moved["bookmakers"][0]["markets"][0]["outcomes"]:
+            oc["point"] = 26.5                              # DraftKings moves LeBron 25.5 -> 26.5
+        q = {"x-daily-remaining": "880"}
+        h = FixtureClient([("events/9001/odds", (moved, q)), ("basketball_nba/events", (self.EVENTS, q))])
+        r3 = collector.collect_props_propline(self.conn, self.cfg, h, now=T0.replace(hour=19))
+        self.assertEqual(r3.items, 2)                       # only the moved DK over/under stored
+        self.assertEqual(r3.unchanged, 2)                   # PrizePicks unchanged
+        mv = self.conn.execute("SELECT * FROM market_signals WHERE to_snapshot_id IN (SELECT id FROM prop_snapshots WHERE run_id=?)", (r3.id,)).fetchall()
+        self.assertEqual({(m["value_before"], m["value_after"]) for m in mv}, {(25.5, 26.5)})
+        r4 = collector.collect_props_propline(self.conn, self.cfg, h, now=T0.replace(hour=20))
+        self.assertEqual((r4.items, r4.unchanged), (0, 4))  # new state is now the baseline
+        # every observation is accounted for: 4 runs x 4 lines
+        total = self.conn.execute("SELECT (SELECT COUNT(*) FROM prop_snapshots WHERE source='propline') + (SELECT COUNT(*) FROM prop_seen)").fetchone()[0]
+        self.assertEqual(total, 16)
+
     def test_request_reserve(self):
         run = collector.collect_props_propline(self.conn, cfg_for(propline_api_key="k", propline_request_reserve=150), self.http("120"), now=T0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM prop_snapshots").fetchone()[0], 0)
@@ -334,8 +357,9 @@ class PropLineTests(unittest.TestCase):
         self.assertIn("collect_props_propline", due)
 
     def test_source_comparison(self):
+        collector.collect_props_propline(self.conn, self.cfg, self.http(), now=T0.replace(hour=15))       # PropLine stored 2h earlier
+        collector.collect_props_propline(self.conn, self.cfg, self.http(), now=T0.replace(minute=20))      # unchanged -> 'seen' row only
         collector.collect_props(self.conn, cfg_for(), client(fx.odds_event(25.5, -112, -108)), now=T0)   # Odds API
-        collector.collect_props_propline(self.conn, self.cfg, self.http(), now=T0.replace(minute=20))      # PropLine 20 min later
         comp = {r["book_key"]: r for r in reports.source_comparison(self.conn)}
         self.assertEqual(comp["draftkings"]["pairs"], 2)
         self.assertEqual(comp["draftkings"]["same_line_pct"], 1.0)
