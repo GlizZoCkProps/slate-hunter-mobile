@@ -62,7 +62,11 @@ jobs:
           if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
             git fetch --depth=1 origin data:refs/remotes/origin/data
             git worktree add --detach datadir origin/data
-            test -f datadir/slate_hunter.db || { echo "::error::data branch exists but has no database; refusing to start fresh"; exit 1; }
+            # The DB is stored gzipped (v0.8+); older snapshots stored it raw.
+            if [ -f datadir/slate_hunter.db.gz ]; then
+              gunzip -c datadir/slate_hunter.db.gz > datadir/slate_hunter.db
+            fi
+            test -s datadir/slate_hunter.db || { echo "::error::data branch exists but has no database; refusing to start fresh"; exit 1; }
             python -m slatehunter integrity --write-baseline baseline.json
           else
             echo "::notice::No data branch yet - creating a new database."
@@ -87,11 +91,13 @@ jobs:
       - name: Guard (integrity + append-only row counts)
         run: python -m slatehunter integrity --baseline baseline.json
 
-      - name: Size check
+      - name: Compress and size check
         run: |
-          SIZE=$(stat -c %s datadir/slate_hunter.db)
-          echo "Database size: $SIZE bytes"
-          if [ "$SIZE" -gt 40000000 ]; then echo "::warning::Database is over 40 MB; GitHub blocks files over 100 MB. See PROJECT_HANDOFF.md (scaling)."; fi
+          gzip -9 -c datadir/slate_hunter.db > datadir/slate_hunter.db.gz
+          gunzip -t datadir/slate_hunter.db.gz
+          RAW=$(stat -c %s datadir/slate_hunter.db); GZ=$(stat -c %s datadir/slate_hunter.db.gz)
+          echo "Database size: $RAW bytes raw, $GZ bytes gzipped"
+          if [ "$GZ" -gt 40000000 ]; then echo "::warning::Compressed database is over 40 MB; GitHub blocks files over 100 MB. See PROJECT_HANDOFF.md (scaling)."; fi
 
       - name: Publish database to the data branch
         run: |
@@ -99,7 +105,8 @@ jobs:
           git config user.name "slate-hunter-collector"
           git config user.email "slate-hunter-collector@users.noreply.github.com"
           git checkout -q --orphan snapshot-$GITHUB_RUN_ID
-          git add -f slate_hunter.db reports
+          git rm -q -f --cached --ignore-unmatch slate_hunter.db
+          git add -f slate_hunter.db.gz reports
           git commit -q -m "data snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ) run $GITHUB_RUN_ID"
           git push -q -f origin HEAD:refs/heads/data
 
@@ -108,5 +115,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: slate-hunter-db-${{ github.run_id }}
-          path: datadir/slate_hunter.db
+          path: datadir/slate_hunter.db.gz
           retention-days: 14
