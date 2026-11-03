@@ -1,7 +1,7 @@
 # Slate Hunter — Project Handoff
 
 Shared source of truth for Claude (implementation) and ChatGPT (research and analytics review).
-Last updated: 2026-10-29 (v0.7: PropLine second source; pregame credit plan; projection input fix + shrink_v2).
+Last updated: 2026-11-03 (v0.8: change-only PropLine storage, gzipped DB, market calibration).
 
 ## 1. What Slate Hunter is
 
@@ -58,6 +58,7 @@ All timestamps are ISO-8601 UTC (`…Z`). Most tables also keep a Central Time c
 | `injury_reports` | append on change | ESPN game-summary injury entries; a new row only when status or detail changes |
 | `projections` | append | `model_version`, projection, `est_prob_over` (NULL until a calibrated model exists), sample size, `inputs_json` for reproducibility |
 | `odds_calls` | append | One row per paid Odds API call: event, Central date, estimated and provider-reported credit cost, rows returned (schema v2) |
+| `prop_seen` | append | Change-only storage (schema v3): one (snapshot_id, run_id) row each time a source returns a line/price identical to its last observation. Snapshot rows + seen rows = every observation. |
 | `player_ids` | upsert | Provider name → ESPN athlete id, with how it was resolved (or why it wasn't) |
 | `results` | upsert per (game, player, market) | Actual stat from the ESPN box score; DNP flagged |
 | `prop_grades` | upsert per (game, book, market, player, side) | Open/close snapshot, line and price, actual, outcome (`win`/`loss`/`push`/`void`/`ungraded` + reason). Covers **every tracked prop, bet or not** |
@@ -182,10 +183,16 @@ A pick is refused if its snapshot is over 3 h old, if the game has started, or i
 
 ## 6. Outstanding work (in priority order)
 
-1. **PropLine live verification (v0.7).** After the first keyed run, check:
+1. **v0.8 storage + findings (2026-11-03).**
+   - The DB reached 43 MB in 5 days (55% of PropLine rows were exact repeats). Fixes: PropLine change-only storage with `prop_seen`, and the data branch stores `slate_hunter.db.gz` (43 MB → 5.6 MB). The workflow restores either .db.gz or the legacy raw .db, and this was simulated on a copy of the live DB.
+   - The Render dashboard's `SLATE_DB_URL` must end in `slate_hunter.db.gz`. `webdb` handles gzip.
+   - Market calibration (new report section): across ~4,200 graded over-side props with two-way prices, overs won ~3 percentage points less than the no-vig close implied in the 0.45–0.55 buckets (e.g. 0.509 implied vs 0.475 realized, n=2,196). This is one week of one season segment. Treat it as a hypothesis to re-test as samples grow, not an edge. Check whether void/DNP handling, early-line grading or PrizePicks mixing contribute.
+   - The projection player cap is now `SLATE_PROJECT_MAX_PLAYERS` (default 150).
+2. **PropLine live verification (v0.7).** After the first keyed run, check:
    - `collection_runs` row `collect_props_propline` is `ok` with `quota_remaining` set.
    - `collection_errors` `NoBookData` rows show which books/sports PropLine lacks (especially NFL/CFB DK/FD).
    - The daily report's "Source agreement" table: same-line % between the Odds API and PropLine for the same book/player/side within 30 min. Decide on making PropLine primary only after several days with high agreement.
+   - Verified 2026-10-30 to 11-02: DK/FD/PrizePicks line agreement with the Odds API 96–99%. No DraftKings CFB props on PropLine (or the Odds API).
    - Then run the live verification above and fix any shape mismatches.
    - Done 2026-10-24: first live run OK (98 games, 1,812 snapshots, 0 unmatched). Fixed 2026-10-29: run cap now fills soonest-first across sports (CFB had been starved); projection and error timestamps now use the job clock.
 2. **Projection models (v0.6.1).** `baseline_v1` (Oct 24 rows) read ESPN's whole game log, which mixes in **preseason** games and is not guaranteed newest-first. Live evidence: LeBron's "last 4" were 17/14/8/10 points. Fixed in `projections.clean_gamelog`. The collector now records two models per player/market:
