@@ -56,6 +56,8 @@ class Config:
     propline_lookahead_hours: int = field(default_factory=lambda: _int("SLATE_PROPLINE_LOOKAHEAD_HOURS", 12))
     propline_request_reserve: int = field(default_factory=lambda: _int("SLATE_PROPLINE_REQUEST_RESERVE", 150))
     propline_max_events_per_run: int = field(default_factory=lambda: _int("SLATE_PROPLINE_MAX_EVENTS_PER_RUN", 30))
+    # Players projected per run (each costs ~2-3 free ESPN requests).
+    project_max_players: int = field(default_factory=lambda: _int("SLATE_PROJECT_MAX_PLAYERS", 150))
     http_timeout: int = field(default_factory=lambda: _int("SLATE_HTTP_TIMEOUT", 15))
 
 

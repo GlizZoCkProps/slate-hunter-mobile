@@ -11,7 +11,7 @@ Design rules:
 import os
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -215,6 +215,17 @@ CREATE TABLE IF NOT EXISTS odds_calls (
 );
 CREATE INDEX IF NOT EXISTS ix_odds_calls_event ON odds_calls(odds_event_id);
 CREATE INDEX IF NOT EXISTS ix_odds_calls_day ON odds_calls(called_date_ct);
+
+-- Change-only storage (schema v3): when a source returns exactly the same lines and
+-- prices for a (book, event, market, player, side) as its last observation, the run
+-- records a row here pointing at the existing snapshot instead of duplicating it.
+-- The observation history stays complete: snapshot rows + seen rows = every observation.
+CREATE TABLE IF NOT EXISTS prop_seen (
+    snapshot_id INTEGER NOT NULL REFERENCES prop_snapshots(id),
+    run_id INTEGER NOT NULL REFERENCES collection_runs(id),
+    PRIMARY KEY (snapshot_id, run_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_prop_seen_run ON prop_seen(run_id);
 
 -- Cache of provider player name -> ESPN athlete id resolutions.
 CREATE TABLE IF NOT EXISTS player_ids (

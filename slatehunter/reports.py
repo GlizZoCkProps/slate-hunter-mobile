@@ -82,21 +82,32 @@ def paper_summary(conn):
 
 
 def source_comparison(conn, since_utc=None, window_min=30):
-    """Compare The Odds API snapshots with the nearest PropLine snapshot for the same
-    game/book/market/player/side taken within `window_min` minutes."""
+    """Compare each Odds API snapshot with the PropLine line observed nearest in time
+    (a stored row or a 'seen again' row) for the same game/book/market/player/side,
+    within `window_min` minutes."""
     where, params = "", []
     if since_utc:
         where, params = "AND a.collected_at_utc >= ?", [since_utc]
     pairs = rows(conn, f"""
-        SELECT a.book_key, a.market, a.line a_line, a.price_american a_price, b.line b_line, b.price_american b_price,
-               ABS(julianday(a.collected_at_utc) - julianday(b.collected_at_utc)) * 1440 gap_min
-        FROM prop_snapshots a JOIN prop_snapshots b
-          ON b.source='propline' AND b.game_id=a.game_id AND b.book_key=a.book_key AND b.market=a.market
-         AND b.player_key=a.player_key AND b.side=a.side
-         AND ABS(julianday(a.collected_at_utc) - julianday(b.collected_at_utc)) * 1440 <= ?
+        WITH obs AS (
+          SELECT s.game_id, s.book_key, s.market, s.player_key, s.side, s.line, s.price_american, s.collected_at_utc t
+          FROM prop_snapshots s WHERE s.source='propline'
+          UNION ALL
+          SELECT s.game_id, s.book_key, s.market, s.player_key, s.side, s.line, s.price_american, r.started_at_utc
+          FROM prop_seen ps JOIN prop_snapshots s ON s.id=ps.snapshot_id JOIN collection_runs r ON r.id=ps.run_id
+          WHERE s.source='propline')
+        SELECT a.id aid, a.book_key, a.line a_line, a.price_american a_price, b.line b_line, b.price_american b_price,
+               ABS(julianday(a.collected_at_utc) - julianday(b.t)) * 1440 gap_min
+        FROM prop_snapshots a JOIN obs b
+          ON b.game_id=a.game_id AND b.book_key=a.book_key AND b.market=a.market AND b.player_key=a.player_key AND b.side=a.side
+         AND ABS(julianday(a.collected_at_utc) - julianday(b.t)) * 1440 <= ?
         WHERE a.source='the_odds_api' AND a.game_id IS NOT NULL {where}""", [window_min] + params)
-    out = {}
+    best = {}
     for p in pairs:
+        if p["aid"] not in best or p["gap_min"] < best[p["aid"]]["gap_min"]:
+            best[p["aid"]] = p
+    out = {}
+    for p in best.values():
         o = out.setdefault(p["book_key"], {"book_key": p["book_key"], "pairs": 0, "same_line": 0, "line_diffs": [], "same_price": 0, "priced": 0})
         o["pairs"] += 1
         if p["a_line"] == p["b_line"]:
@@ -114,6 +125,35 @@ def source_comparison(conn, since_utc=None, window_min=30):
         o["same_price_pct"] = round(o["same_price"] / o["priced"], 3) if o["priced"] else None
         result.append(o)
     return sorted(result, key=lambda x: x["book_key"])
+
+
+def market_calibration(conn, since_utc=None, width=0.05):
+    """Over-side props graded win/loss whose closing snapshot has both prices: bucket
+    the no-vig over probability and compare with how often the over actually won.
+    A well-calibrated market has realized ~= implied in every bucket."""
+    from .grading import side_no_vig
+    where, params = "", ()
+    if since_utc:
+        where, params = "AND g.start_time_utc >= ?", (since_utc,)
+    data = conn.execute(f"""SELECT pg.outcome, s.* FROM prop_grades pg JOIN prop_snapshots s ON s.id=pg.close_snapshot_id
+                            JOIN games g ON g.id=pg.game_id
+                            WHERE pg.side='over' AND pg.outcome IN ('win','loss') AND s.price_american IS NOT NULL {where}""", params).fetchall()
+    buckets = {}
+    for r in data:
+        p = side_no_vig(conn, r)
+        if p is None:
+            continue
+        lo = min(int(p / width) * width, 1 - width)
+        b = buckets.setdefault(round(lo, 2), {"n": 0, "implied_sum": 0.0, "wins": 0})
+        b["n"] += 1
+        b["implied_sum"] += p
+        b["wins"] += r["outcome"] == "win"
+    out = []
+    for lo in sorted(buckets):
+        b = buckets[lo]
+        out.append({"bucket": f"{lo:.2f}-{lo + width:.2f}", "n": b["n"], "avg_implied_over": round(b["implied_sum"] / b["n"], 3),
+                    "realized_over": round(b["wins"] / b["n"], 3)})
+    return out
 
 
 def source_coverage(conn, since_utc):
@@ -209,6 +249,10 @@ def daily_report(conn, now=None):
           "| source | sport | book | games | snapshots |", "|---|---|---|---|---|"]
     for r in source_coverage(conn, iso_utc(now - timedelta(hours=24))):
         L.append(f"| {r['source']} | {r['sport']} | {r['book_key']} | {r['games']} | {r['snapshots']} |")
+    L += ["", "## Market calibration, last 30 days (no-vig over probability at close vs how often the over won)", "",
+          "| implied bucket | n | avg implied | realized |", "|---|---|---|---|"]
+    for r in market_calibration(conn, since):
+        L.append(f"| {r['bucket']} | {r['n']} | {r['avg_implied_over']} | {r['realized_over']} |")
     L += ["", "## Source agreement, last 7 days (Odds API vs PropLine, same book/player/side, snapshots ≤30 min apart)", "",
           "| book | pairs | same line | mean abs line diff | same price (priced pairs) |", "|---|---|---|---|---|"]
     for r in source_comparison(conn, iso_utc(now - timedelta(days=7))):

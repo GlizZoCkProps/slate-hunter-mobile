@@ -33,11 +33,15 @@ def db_location():
             try:
                 r = requests.get(url, timeout=30)
                 r.raise_for_status()
-                if not r.content.startswith(b"SQLite format 3"):
+                content = r.content
+                if content[:2] == b"\x1f\x8b":          # gzip (data branch stores slate_hunter.db.gz)
+                    import gzip
+                    content = gzip.decompress(content)
+                if not content.startswith(b"SQLite format 3"):
                     raise ValueError("downloaded file is not a SQLite database")
                 tmp = path + ".part"
                 with open(tmp, "wb") as f:
-                    f.write(r.content)
+                    f.write(content)
                 os.replace(tmp, path)
                 _state.update(fetched=time.time(), error=None)
             except Exception as exc:

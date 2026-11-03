@@ -36,6 +36,7 @@ class Run:
     def __init__(self, conn, job, now=None):
         self.conn, self.job, self.now = conn, job, now
         self.items = 0
+        self.unchanged = 0
         self.errors = 0
         self.missing = 0
         self.message = ""
@@ -81,7 +82,8 @@ class Run:
             status = "partial"
         else:
             status = "ok"
-        msg = self.message or f"{self.items} written, {self.errors} errors, {self.missing} missing"
+        msg = self.message or (f"{self.items} written, " + (f"{self.unchanged} unchanged (seen), " if self.unchanged else "")
+                               + f"{self.errors} errors, {self.missing} missing")
         self.conn.execute(
             "UPDATE collection_runs SET finished_at_utc=?, status=?, items_written=?, error_count=?, message=?, "
             "quota_remaining=?, quota_used=? WHERE id=?",
@@ -318,6 +320,26 @@ def collect_props(conn, cfg, http, now=None):
     return run
 
 
+def _current_state(conn, source, odds_event_id):
+    """For each (book, market, player, side) of one event: the {(line, price): snapshot_id}
+    observed in the most recent run that saw that key (as a new row or a 'seen' row)."""
+    obs = conn.execute(
+        """SELECT s.id sid, s.run_id rid, s.book_key, s.market, s.player_key, s.side, s.line, s.price_american
+           FROM prop_snapshots s WHERE s.source=? AND s.odds_event_id=?
+           UNION ALL
+           SELECT s.id, ps.run_id, s.book_key, s.market, s.player_key, s.side, s.line, s.price_american
+           FROM prop_seen ps JOIN prop_snapshots s ON s.id=ps.snapshot_id WHERE s.source=? AND s.odds_event_id=?""",
+        (source, odds_event_id, source, odds_event_id)).fetchall()
+    latest, state = {}, {}
+    for o in obs:
+        k = (o["book_key"], o["market"], o["player_key"], o["side"])
+        if o["rid"] > latest.get(k, -1):
+            latest[k], state[k] = o["rid"], {}
+        if o["rid"] == latest[k]:
+            state[k][(o["line"], o["price_american"])] = o["sid"]
+    return state
+
+
 def _last_propline_quota(conn, now):
     """Remaining PropLine requests today, from the latest run on the same UTC day."""
     row = conn.execute("SELECT quota_remaining, started_at_utc FROM collection_runs WHERE job='collect_props_propline' "
@@ -384,15 +406,28 @@ def collect_props_propline(conn, cfg, http, now=None):
                 if b not in {x["book_key"] for x in rows}:
                     run.log("missing", propline.SOURCE, scope, "NoBookData", f"{b} returned no player props for {','.join(markets)}")
             ts_utc, ts_ct = iso_utc(now), iso_ct(now)
+            event_key = f"pl:{ev['id']}"
+            current = _current_state(conn, propline.SOURCE, event_key)
+            grouped = {}
             for x in rows:
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO prop_snapshots(run_id, collected_at_utc, collected_at_ct, source, book_key, book_title, region, sport, "
-                    "game_id, odds_event_id, commence_time_utc, market, source_market_key, player_name, player_key, side, line, price_american, book_last_update_utc) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (run.id, ts_utc, ts_ct, propline.SOURCE, x["book_key"], x["book_title"], x["region"], sport,
-                     game["id"] if game else None, f"pl:{ev['id']}", iso_utc(start), x["market"], x["source_market_key"],
-                     x["player_name"], x["player_key"], x["side"], x["line"], x["price_american"], x["book_last_update"]))
-                run.items += cur.rowcount
+                grouped.setdefault((x["book_key"], x["market"], x["player_key"], x["side"]), []).append(x)
+            for key, xs in grouped.items():
+                state = sorted((x["line"], x["price_american"]) for x in xs)
+                prev = current.get(key)
+                if prev is not None and sorted(prev) == state:
+                    for sid in prev.values():
+                        conn.execute("INSERT OR IGNORE INTO prop_seen(snapshot_id, run_id) VALUES (?,?)", (sid, run.id))
+                    run.unchanged += len(xs)
+                    continue
+                for x in xs:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO prop_snapshots(run_id, collected_at_utc, collected_at_ct, source, book_key, book_title, region, sport, "
+                        "game_id, odds_event_id, commence_time_utc, market, source_market_key, player_name, player_key, side, line, price_american, book_last_update_utc) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (run.id, ts_utc, ts_ct, propline.SOURCE, x["book_key"], x["book_title"], x["region"], sport,
+                         game["id"] if game else None, event_key, iso_utc(start), x["market"], x["source_market_key"],
+                         x["player_name"], x["player_key"], x["side"], x["line"], x["price_american"], x["book_last_update"]))
+                    run.items += cur.rowcount
             conn.commit()
         if not candidates:
             run.message = f"no games starting before {iso_utc(horizon)}"
@@ -443,12 +478,13 @@ def detect_moves(conn, run_id):
 
 # ---------------------------------------------------------------- projections
 
-def project(conn, cfg, http, now=None, max_players=60, refresh_hours=12):
+def project(conn, cfg, http, now=None, max_players=None, refresh_hours=12):
     """baseline_v1_1 and shrink_v2 projections for players with snapshots in upcoming games.
     Uses ESPN regular-season game logs (current + prior season); one projection per
     (game, player, market, model) per refresh window."""
     from . import projections as pj
     now = now or utc_now()
+    max_players = max_players or cfg.project_max_players
     with Run(conn, "project", now) as run:
         todo = conn.execute(
             """SELECT s.sport, s.game_id, s.player_name, s.player_key, s.market, MAX(s.id) snap_id
